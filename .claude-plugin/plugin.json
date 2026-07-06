@@ -1,0 +1,13 @@
+{
+  "name": "gan-zhong-xue",
+  "version": "1.0.0",
+  "description": "干中学 (Learning by Doing): turn AI-shipped changes you didn't truly understand into understanding you can restate and transfer. Cures vibe-coding.",
+  "author": {
+    "name": "ly8427",
+    "url": "https://github.com/ly8427"
+  },
+  "homepage": "https://github.com/ly8427/gan-zhong-xue",
+  "repository": "https://github.com/ly8427/gan-zhong-xue",
+  "license": "MIT",
+  "keywords": ["learning", "vibe-coding", "skill", "claude-code", "socratic"]
+}

@@ -1,0 +1,26 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "gan-zhong-xue",
+  "description": "干中学 (Learning by Doing) — a Claude Code skill that turns the changes AI shipped for you but you didn't truly understand into understanding you can restate and transfer. Cures vibe-coding.",
+  "owner": {
+    "name": "ly8427"
+  },
+  "plugins": [
+    {
+      "name": "gan-zhong-xue",
+      "source": "./",
+      "description": "干中学: turn-based guess→reveal→principle loop, cold-read sub-agent, cross-session knowledge map. Cures vibe-coding (delivery up, understanding flat).",
+      "version": "1.0.0",
+      "author": {
+        "name": "ly8427"
+      },
+      "homepage": "https://github.com/ly8427/gan-zhong-xue",
+      "repository": "https://github.com/ly8427/gan-zhong-xue",
+      "license": "MIT",
+      "keywords": ["learning", "vibe-coding", "skill", "claude-code", "socratic", "understanding"],
+      "category": "workflow",
+      "tags": ["learning", "vibe-coding", "skill"],
+      "strict": false
+    }
+  ]
+}

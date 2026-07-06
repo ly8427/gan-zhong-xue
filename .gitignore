@@ -1,0 +1,15 @@
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Claude Code per-machine local settings (never commit)
+.claude/settings.local.json
+*.local
+
+# The skill's runtime map lives at ~/.gan-zhong-xue/ (user home),
+# never inside this repo — but just in case:
+gan-zhong-xue-state/
