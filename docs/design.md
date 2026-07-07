@@ -1,4 +1,4 @@
-# 设计记录 · gan-zhong-xue v1.0.0
+# 设计记录 · gan-zhong-xue v1.0.1
 
 > 把 `干中学` skill 发布到 GitHub 的设计决策。2026-07-06。
 

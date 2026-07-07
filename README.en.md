@@ -19,8 +19,8 @@ It's a **cognitive gym, not an answer bot.** It makes you guess first, pushes yo
 
 Then, mid-task or after a commit — **three ways to trigger** (most → least reliable):
 
-- **Most reliable**: type `/gan-zhong-xue`
-- **Natural**: say something specific: "干中学" / "help me actually understand what you just did" / "I didn't really get that last change" / "I can't explain this commit"
+- **Most reliable**: type `/gan-zhong-xue` (slash commands match the ASCII name only; `/干中学` won't fire)
+- **Natural**: say something specific: "干中学" / "help me actually understand what you just did" / "I can't explain this commit"; mid-task works too: "wait, I didn't follow that step" / "why did you change it this way"
 - ⚠️ Vague "I don't get it, explain" may not trigger — this skill needs the intent "understand a real change I was part of", not a generic code question
 
 **Use a strong model** (Opus-class). Weaker models dump answers and ask stiffly.
