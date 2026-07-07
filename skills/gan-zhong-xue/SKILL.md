@@ -5,9 +5,11 @@ description: |
   回头搞懂一个甩手没懂的改动），就地陪你走一轮"先让你猜、再揭示、逼到原理"的回合制，
   把黑盒变成你真懂、能复述、能迁移的东西。治的是 vibe-coding 的病：交付物在增加，
   理解没跟上。触发词："干中学"、"帮我搞懂 AI 正在做的这步"、"我刚才那段没懂"、
-  "这个 commit 我说不清"、"帮我真正搞懂刚才做的"。
+  "这个 commit 我说不清"、"帮我真正搞懂刚才做的"；掌舵（任务中途）："等等这步我没懂"、
+  "为什么这么改"、"这步我没跟上"。
   English triggers: "learning by doing", "help me actually understand what you just did",
-  "I didn't really get that last change", "I can't explain this commit".
+  "I didn't really get that last change", "I can't explain this commit"; mid-task:
+  "wait, I didn't follow that step", "why did you change it this way".
   Output language follows the user (中文入中文出 / 英文入英文出，规则本体不变)。
 allowed-tools:
   - Bash

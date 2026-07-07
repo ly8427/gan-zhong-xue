@@ -18,7 +18,7 @@
 - marketplace / plugin 名：`gan-zhong-xue`（ASCII，命令行/URL 友好）
 - skill 文件夹：`gan-zhong-xue`（ASCII 安装路径）
 - skill `name:`：`gan-zhong-xue`（ASCII，符合 skill 规范——`name` 只允许字母/数字/连字符，见 writing-skills 指南）。folder 与 name 一致，无需再验证。
-- 中文身份不靠 `name` 字段，靠：正文标题 `# 干中学`、description 里的中文触发词（"帮我搞懂 AI 正在做的这步"…）、README。触发以 description 语义为主，用户说中文即触发，不必手敲 `/` 命令。
+- 中文身份不靠 `name` 字段，靠：正文标题 `# 干中学`、description 里的中文触发词（"帮我搞懂 AI 正在做的这步"…）、README。触发两路：**确定性** `/gan-zhong-xue`（最稳）+ **语义**（description 匹配：明确意图能中、太泛的"我不懂给我讲"不稳）。注意 `/干中学` 不是命令名（name 字段是 gan-zhong-xue），只能"说"、不能"敲"。
 
 ### 语言方案：中文本体 + 英文 README 摘要 + 两条缝
 - skill 本体保持中文（哲学锚 / 触发词的味不丢）

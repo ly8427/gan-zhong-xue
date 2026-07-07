@@ -17,9 +17,11 @@ It's a **cognitive gym, not an answer bot.** It makes you guess first, pushes yo
 /plugin install gan-zhong-xue@gan-zhong-xue
 ```
 
-Then, mid-task or after a commit, say:
+Then, mid-task or after a commit — **three ways to trigger** (most → least reliable):
 
-> "help me actually understand what you just did" / "I didn't really get that last change" / "I can't explain this commit"
+- **Most reliable**: type `/gan-zhong-xue`
+- **Natural**: say something specific: "干中学" / "help me actually understand what you just did" / "I didn't really get that last change" / "I can't explain this commit"
+- ⚠️ Vague "I don't get it, explain" may not trigger — this skill needs the intent "understand a real change I was part of", not a generic code question
 
 **Use a strong model** (Opus-class). Weaker models dump answers and ask stiffly.
 
