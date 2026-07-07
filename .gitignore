@@ -13,3 +13,7 @@ Thumbs.db
 # The skill's runtime map lives at ~/.gan-zhong-xue/ (user home),
 # never inside this repo — but just in case:
 gan-zhong-xue-state/
+
+# Local test artifacts / scratch (reviewers' test harness, etc.) — never commit
+tmp/
+
