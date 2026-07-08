@@ -140,15 +140,21 @@ sub-agent**，它**只看最终 diff / 代码，不看本次开发的对话历�
 ## 执行流程
 
 ### 第 -1 步：先读 pending + 地图（续传 + 跨时间裁判，都别跳）
-**只读、不写、不删、不迁移**。两个文件都读——`map.md` 是富文本内容库（含"只有 md、没进 jsonl"的旧格子），`map.jsonl` 是结构化索引（给复验调度用）。**判空 = 两个都空**才算第一次。
+**只读、不写、不删、不迁移**。每次只读**瘦索引 `map.jsonl`**（够做命中检测 + 复验调度 + 概览，且不随地图膨胀爆 token）；**`map.md` 是细节库、不全读**——挖到某格才按需 grep 那一格（见下）。**判空 = jsonl 和 md 都空**才算第一次。
 ```bash
 mkdir -p ~/.gan-zhong-xue && chmod 700 ~/.gan-zhong-xue 2>/dev/null   # 建目录 + 收紧权限（只自己可读写）
 [ -s ~/.gan-zhong-xue/pending.md ] && cat ~/.gan-zhong-xue/pending.md && echo "↑ 上次没挖完，先问用户要不要接着挖"
-echo "=== 索引 map.jsonl（全量读、不截断——旧格才能被跨时间复验命中；坏行跳过）==="; cat ~/.gan-zhong-xue/map.jsonl 2>/dev/null || echo "（无 jsonl）"
-echo "=== 内容 map.md ==="; cat ~/.gan-zhong-xue/map.md 2>/dev/null || echo "（无 md）"
-{ [ -s ~/.gan-zhong-xue/map.jsonl ] || [ -s ~/.gan-zhong-xue/map.md ]; } || echo "（两文件都空 = 第一次，本轮写第一格）"
+# 每次只读瘦索引 jsonl（不截断、旧格都能命中）；md 细节不全读、按需 grep（见下条）
+if [ -s ~/.gan-zhong-xue/map.jsonl ]; then
+  echo "=== 索引 map.jsonl（瘦、全量、坏行跳过）==="; cat ~/.gan-zhong-xue/map.jsonl
+elif [ -s ~/.gan-zhong-xue/map.md ]; then
+  echo "=== jsonl 空、md 有遗留（一次性兜底全读 md）==="; cat ~/.gan-zhong-xue/map.md
+else
+  echo "（jsonl 和 md 都空 = 第一次，本轮写第一格）"
+fi
 ```
-- **只有 md、jsonl 空**（弱模型只写了 md 那种）→ **不报空、不算丢**：md 里那些格子照样算数。**不迁移、不解析 md 去生成 jsonl**（那会丢细节/出错，见第 3 步）；jsonl 往后逐轮自然建立。
+- **md 按需读、不全 cat**：`map.md` 是最胖的细节库，**别每次全读**（随地图膨胀会爆 token）。需要某一格细节（复验命中、或挖到它）时只读那一格，例如 `grep -F -A 8 -- '## <概念>' ~/.gan-zhong-xue/map.md`（`-F` 固定串——概念里的 `.`/`[` 不当正则；单引号防 `$(...)` 注入；`--` 防概念以 `-` 开头）。
+- **遗留 md-only 格子**（jsonl 空、只有 md，弱模型写的那种）→ 上面 elif 一次性兜底全读 md，不报空、不算丢；**不迁移、不解析 md 生成 jsonl**（会丢细节/出错）。注意：等 jsonl 有了新格之后，老的 md-only 格不再自动浮现（没丢、还在 md，需要时 grep）。
 - **jsonl 读到不认识的字段**（将来新版可能加）→ 忽略、别崩。**坏 JSON 行** → 跳过那一行、别整份丢弃。
 - **pending 非空**：先告诉用户"上次你说想挖 N 个、只挖了 M 个，还剩这些：…接着挖吗？"
   要 → 优先挖 pending。**不要 → 必须用户明确确认"这些不要了"才能清空 pending**（pending 是瞬态待办；清空只动 pending、**绝不碰 map.md/jsonl**；用户没确认就保留）。**绝不让想挖的点默默消失。**
@@ -249,6 +255,7 @@ git diff HEAD~1 --stat 2>/dev/null   # 或让用户指定 commit / 一段 staged
 - [ ] 这一轮往地图写了一格、带时间戳和"待复验"、并问了"哪里你纠正了我"吗？
 - [ ] **写 `map.md`/`map.jsonl` 时全用 `>>` 追加、没有任何覆盖数据文件的 `>`（单）/ `open('w')` / `rm` / 覆盖式 `mv`？（`2>/dev/null` 这种 stderr 重定向不算违规；pending 是瞬态、用户确认后可清——也不算。有真覆盖 = 破铁则、可能毁记录，失败）**
 - [ ] 这一轮 md 和 jsonl **都**追加了吗？（只写一份 = 内容或索引缺，要补两份）
+- [ ] **第 -1 步没有全 `cat map.md`**（只读 jsonl，或遗留兜底）？需要某格细节时按需 `grep` 那一格？（全 cat md = 随地图膨胀爆 token）
 - [ ] **地图/pending/报告里有没有漏进具体值（芯片/寄存器/地址/公司名）？（有 = 破隐私铁则，失败）**
 - [ ] 被打断时把没挖完的点写进 pending 了吗？
 - [ ] 全程零代码外传、纯本地了吗？

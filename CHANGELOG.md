@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.0.3 — 2026-07-08
+
+Perf: bound 第-1步 read cost — stop catting the bulky `map.md` every run.
+
+- **Problem**: 第-1步 cat'd BOTH `map.md` (rich, bulky) and `map.jsonl` every run. Both grow unboundedly (append-only) → at hundreds of rounds, each skill-run dumped tens of thousands of tokens; `map.md` is the dominant cost.
+- **Fix**: 第-1步 now cats only the thin index `map.jsonl` each run (enough for hit-detection + 复验 scheduling). `map.md` is read **on-demand** — grep just the cell being worked (e.g., `grep -A 8 "^## <概念>" map.md`), never wholesale. Cuts per-run variable cost ~60-70% (drops the bulky md).
+- **Legacy fallback**: if jsonl is empty but md has content (Sonnet-style md-only case), it cats md each run until the first jsonl line is written. Once jsonl is non-empty, legacy md-only cells aren't auto-surfaced (data not lost — still in md, grep if needed); going forward all cells go to jsonl.
+- **No data-safety change**: still append-only; this is a read-strategy change only — writes untouched.
+- **Honest ceiling**: thin jsonl still grows linearly; at thousands of rounds it'd need selective read (sample 复验-due + recent) or archival. Deferred (少就是多; revisit when a real map gets huge).
+
 ## v1.0.2 — 2026-07-08
 
 Fix: map data integrity — **append-only, never overwrite**. (Supersedes an earlier "jsonl-single-truth + regenerate md" draft, which risked losing md detail on regeneration and depended on python3.)

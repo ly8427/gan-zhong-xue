@@ -10,7 +10,7 @@
       "name": "gan-zhong-xue",
       "source": "./",
       "description": "干中学: turn-based guess→reveal→principle loop, cold-read sub-agent, cross-session knowledge map. Cures vibe-coding (delivery up, understanding flat).",
-      "version": "1.0.2",
+      "version": "1.0.3",
       "author": {
         "name": "ly8427"
       },
