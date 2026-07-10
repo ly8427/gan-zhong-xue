@@ -1,3 +1,5 @@
+[English](README.en.md) | [中文](README.md)
+
 # 干中学 (Learning by Doing)
 
 > 治 vibe-coding 的病：**交付物在涨，理解没跟上。**

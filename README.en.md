@@ -1,3 +1,5 @@
+[English](README.en.md) | [中文](README.md)
+
 # 干中学 (Learning by Doing)
 
 > Cures **vibe-coding**: your shipped output keeps growing, but your understanding doesn't keep up.
