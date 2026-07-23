@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.0.4 — 2026-07-24
+
+Depth: fix "digs too shallow — asks 2-3 questions then wraps up." Field report: a subsystem-level goal ("how is this kernel repo selected & built, which .bb/config files are involved, what's the principle") got compressed into one point and closed after three questions.
+
+- **Root cause (structural, not laziness)**: the lesson had only a *one-point* shape. (a) The cold-read sub-agent returned "one point + one apex principle + one question" — a flat structure that can only grow a ~3-question lesson; the depth ceiling was welded in before digging started. (b) Termination was "user restates the principle" — stops at the first sign of satisfaction, the shallowest layer. (c) Success was defined as "even one point," making the pass-bar the target. (d) No depth floor; "少就是多" was over-applied — the model read "small blocks" (right) as "few blocks" (wrong) and retreated into early wrap-up.
+- **Fix (borrows gstack's PLAN≠EXECUTE / anti-skip / push-twice / explicit depth criteria)**:
+  - **第1步 sub-agent now returns an agenda graph + per-node descent ladder**, not one point. The graph is a concept-dependency decomposition sized to the target (2-3 nodes for a narrow question, 6-10 for a subsystem goal); each node carries a 3-6 rung "why" ladder down to a **cross-domain transferable law**. A subsystem learning goal is now a legal target that gets a graph, not a single point.
+  - **第2步 walks the graph node-by-node**; each node has a bedrock gate (3 red flags: still reciting what-the-code-did / principle only fits this code / user hasn't been surprised) and must push ≥1 layer past the first "got it."
+  - **Termination = every agenda node dug-to-bedrock OR explicitly dropped by the user** (no silent skip); "done" = the user can **transfer** the law to a different domain, not restate it.
+  - **New iron law 8** (depth floor + anti-early-exit); "少就是多" scoped to *block size*, not *lesson depth*.
+  - **Success redefined**: one genuine insight = pass-bar; a transferable law + full agenda coverage = target.
+  - **Release valve preserved**: user can tap out → unfinished nodes go to `pending.md`; trust-gate (iron law 7) still prevents over-pushing. Anti-skip targets *AI silently omitting*, never *the user choosing to stop*.
+- **No data-safety change**: 第3步 map write path untouched — still append-only (`>>`), never overwrite.
+- **Honest ceiling**: depth now depends on (a) the model being strong enough to run the fuller protocol and (b) the sub-agent producing a good graph; still n=1 (author-validated), independent testers remain the missing experiment.
+
 ## v1.0.3 — 2026-07-08
 
 Perf: bound 第-1步 read cost — stop catting the bulky `map.md` every run.
