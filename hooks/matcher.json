@@ -1,0 +1,49 @@
+{
+  "$comment": "D4（thread #80）：matcher 是待验证配置，不是已验证配置。下表的模式与各宿主的接线都是待实测项——可达性矩阵（哪个宿主哪个事件真的收到哪个工具的事件）必须实测填表后才能写进 README 作承诺。本文件是配置与计划的记录，不是能力声明。",
+  "version": "1.0.9-UNVERIFIED",
+  "targets": [
+    {
+      "host": "claude-code",
+      "file": "plugin hooks/hooks.json（${CLAUDE_PLUGIN_ROOT} 展开）",
+      "status": "待实测",
+      "events": [
+        {
+          "event": "PreToolUse",
+          "matcher": "Bash|Write|Edit|MultiEdit|Agent",
+          "hook": "hooks/gzx-guard.py",
+          "reachability": {
+            "Bash": "可达（主命令面）",
+            "Write": "本 skill allowed-tools 未含 Write/Edit——今日不可达，保留防将来放开（dsh #811②）",
+            "Edit": "同上",
+            "MultiEdit": "同上",
+            "Agent": "可达（子 agent 调用面）"
+          }
+        },
+        {
+          "event": "PostToolUse",
+          "matcher": "Bash",
+          "hook": "hooks/gzx-capture.py",
+          "reachability": { "Bash": "可达（git commit 捕获面）" }
+        }
+      ]
+    },
+    {
+      "host": "zcode",
+      "file": "~/.zcode/cli/config.json 的 hooks.events（配置面不同，非缺失——dsh #811§1）",
+      "status": "待实测",
+      "events": [
+        {
+          "event": "PreToolUse",
+          "matcher": "待按本文件同形接线后实测",
+          "hook": "hooks/gzx-guard.py",
+          "reachability": { "说明": "本板 cli/config.json 已证 ZCode hook 机制存在（评审自用三闸即证）；skill 侧接线与事件形状待实测" }
+        }
+      ]
+    }
+  ],
+  "known_limitations": [
+    "cd 到受保护目录内后不提名字的写法拦不住（减速带定位，非安全边界——#810 如实记录）",
+    "deny 与 allow 都只影响引用了受保护目录的调用；范围外命令零审计零拦截",
+    "hooks.json 在宿主接线失败时 fail-open：闸不跑 = 看起来跟通过一样——所以安装验收必须先验 hook_alive（D6 第一阶段）"
+  ]
+}
