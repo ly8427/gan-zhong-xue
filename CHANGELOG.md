@@ -1,5 +1,32 @@
 # Changelog
 
+## v1.1.0 — 2026-11-11
+
+**GPT PR #4 审查收口：5×P1 + 3×P2 全部闭环——安装引导/守卫豁免/原子去重/失败提交不误记/集成测试入仓。**
+
+- **P1-1 首次安装部署写入器**：第 -1 步引导块（`<SKILL_DIR>` 占位）从技能目录
+  复制写入器两件到数据目录；守卫对 cp 写入器 / mkdir / chmod 数据目录三类
+  引导操作放行（拷数据出目录仍拦）。
+- **P1-2 守卫拦自家启动**：同上豁免 + selftest 增 4 allow / 1 deny。
+- **P1-3 pending 直写**：第 4 步改经写入器追加，`>>` 直写违规字样移除。
+- **P1-4 去重非原子**：核心新增 `lock_append_commit_unique`——去重/序号/追加
+  同一临界区；capture 改调它，seq 锁内现算。
+- **P1-5 失败提交记错 HEAD**：capture 以 `[分支 sha]` 成功标记为捕获前提 +
+  与 rev-parse HEAD 复核；失败提交不捕获不误记。
+- **P2-6 写失败反馈**：SKILL 第 3/4 步明确失败必须原样转述 stderr 状态行。
+- **P2-7 审计首行竞态**：hook_alive 预置移入核心锁内（prepend_if_missing）。
+- **P2-8 集成测试入仓**：`hooks/test-gzx-integration.py` 17 项——真实 git 仓库
+  全链路（引导安装 / 守卫豁免与反向拦截 / 审计首行唯一 / 真提交捕获+去重+
+  失败不捕 / 并发恰一行 / pending 写入器追加）。
+- **模块名修正**：`gzx-lock-append.py` → `gzx_lock_append.py`（连字符不可
+  import——v1.0.9 起导入一直失败、被独立部署兜底路径掩盖；GPT 审查 C 组
+  审计首行缺陷的根因）。
+- **跨形态目录规范化**：核心 `_normalize_dir`——POSIX python 收到 `C:\`
+  盘符路径 / Windows python 收到 `/mnt|/c` 形态时自动换算（bash 写入器
+  path B 实证：exec 到 WSL python3 时曾把数据写进字面量 `C:` 相对目录）。
+- **验证**：集成 17 项 + 不变量 40 项 + 守卫 selftest 36 用例全过，随改两遍稳定。
+
+
 ## v1.0.9 — 2026-11-10
 
 **修"数据面只有文字约束"（board thread #80 定案 D1-D7）——append-only 从模型自觉变机器不变量，hook 只做减速带+审计。**
