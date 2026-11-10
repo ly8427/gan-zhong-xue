@@ -111,6 +111,25 @@ def _seg_head_is_allowed(seg):
     return False
 
 
+# V1.1.0（P1-2 引导豁免）：首次安装需要把写入器部署进数据目录并初始化权限——
+# 这三段操作若被守卫拦下，新用户永远装不起来（GPT PR #4 审查 P1-2 实景）。
+# 豁免口径（减速带定位内、逐段可判定）：
+#   cp/install —— 仅当段内出现写入器文件名 token（部署写入器本体）；
+#   mkdir/chmod —— 仅当段内引用受保护目录本身（mkdir -p / chmod 700 初始化）。
+# 已接受的余量：chmod 数值不做白名单（用户对自己的数据目录有权变更权限）。
+BOOTSTRAP_CP_MARK = "gzx-append"
+BOOTSTRAP_SETUP = {"mkdir", "chmod"}
+
+
+def _seg_is_bootstrap(seg):
+    head = seg[0].rsplit("/", 1)[-1]
+    if head in ("cp", "install"):
+        return any(BOOTSTRAP_CP_MARK in t for t in seg[1:])
+    if head in BOOTSTRAP_SETUP:
+        return any(PROTECTED_MARK in t for t in seg[1:])
+    return False
+
+
 def classify(cmd):
     """对一条 Bash 命令做守卫判定。返回 Decision。纯函数，便于测试。"""
     # 范围条件：不引用受保护目录 → 放行（D3：保守 deny 以引用受保护路径为条件）
@@ -159,6 +178,8 @@ def classify(cmd):
             for t in seg[1:]:
                 if t == "-i" or (t.startswith("-i") and len(t) > 2 and t[2] != "n"):
                     return Decision(False, head + ":-i")
+        if _seg_is_bootstrap(seg):
+            continue   # V1.1.0(P1-2):写入器引导安装/数据目录初始化 → 放行
         if not _seg_head_is_allowed(seg):
             # 前缀层：非白名单/写入器 → deny（裸 python3 -c open('w') 的唯一拦截点）
             return Decision(False, "prefix:" + head)
@@ -176,32 +197,34 @@ def _is_protected(tok):
 # ─────────────────────────── 审计（D1：不落命令原文）────────────────────────────
 
 def _core_path():
-    """写入器不变量核心 gzx-lock-append.py（唯一实现，bash 面与 python 面共用）。"""
+    """写入器不变量核心 gzx_lock_append.py（唯一实现，bash 面与 python 面共用）。"""
     here = os.path.dirname(os.path.abspath(__file__))
-    cand = os.path.join(here, "..", "skills", "gan-zhong-xue", "gzx-lock-append.py")
+    cand = os.path.join(here, "..", "skills", "gan-zhong-xue", "gzx_lock_append.py")
     if os.path.exists(cand):
         return cand
-    return os.path.join(GZX_DIR, "gzx-lock-append.py")   # 首次运行复制到数据目录的副本
+    return os.path.join(GZX_DIR, "gzx_lock_append.py")   # 首次运行复制到数据目录的副本
 
 
 def _audit(tool, allowed, rule):
-    """审计一行（经写入器核心，单写者纪律）。内容 = 元数据 only，绝无命令/参数原文。"""
+    """审计一行（经写入器核心，单写者纪律）。内容 = 元数据 only，绝无命令/参数原文。
+    V1.1.0（P2-7）:hook_alive 首行的存在性检查+预置移入写入器核心锁内
+    （prepend_if_missing）——并发守卫不再产生重复首行。"""
     try:
         audit_file = os.path.join(GZX_DIR, "audit.jsonl")
-        lines = []
+        alive = None
         if not os.path.exists(audit_file):
-            lines.append(json.dumps({
+            alive = json.dumps({
                 "ts": _now(), "event": "hook_alive", "hook": "gzx-guard",
-            }, ensure_ascii=False))
-        lines.append(json.dumps({
+            }, ensure_ascii=False) + "\n"
+        line = json.dumps({
             "ts": _now(),
             "tool": tool,
             "decision": "allow" if allowed else "deny",
             "rule": rule,
-        }, ensure_ascii=False))
-        data = ("\n".join(lines) + "\n").encode()
+        }, ensure_ascii=False) + "\n"
+        data = line.encode()
         if lock_append is not None:
-            lock_append(GZX_DIR, "audit", data)          # 进程内直调核心（无子进程）
+            lock_append(GZX_DIR, "audit", data, prepend_if_missing=alive)  # 进程内直调核心
         else:
             subprocess.run([sys.executable, _core_path(), "audit"], input=data,
                            capture_output=True, timeout=20)   # 独立部署兜底
@@ -254,9 +277,15 @@ def selftest():
         "gzx-append map",                                    # 写入器：PATH 直调（范围外，顺带验）
         "cat payload | gzx-append candidates",               # 写入器：管道段尾
         "bash ~/.gan-zhong-xue/gzx-append.sh map",           # 写入器：shell 包装
+        # V1.1.0(P1-2):首次安装引导三段——部署写入器/建目录/收权限
+        "cp skills/gan-zhong-xue/gzx-append.sh ~/.gan-zhong-xue/gzx-append.sh",
+        "cp ~/.gan-zhong-xue/gzx-append.sh ~/.gan-zhong-xue/gzx_lock_append.py.bak",
+        "mkdir -p ~/.gan-zhong-xue",
+        "chmod 700 ~/.gan-zhong-xue",
     ]
     denies = [
         ("cat x > ~/.gan-zhong-xue/map.jsonl", "redirect"),                     # #815 §3
+        ("cp ~/.gan-zhong-xue/map.md /tmp/evil.md", "prefix:cp"),               # V1.1.0:拷数据出受保护目录仍拦
         ("cat ~/.gan-zhong-xue/map.md > ~/.gan-zhong-xue/map.jsonl", "redirect"),
         ("sed -i s/a/b/ ~/.gan-zhong-xue/map.md", "sed"),                       # #819 §1
         ("cat ~/.gan-zhong-xue/map.md | tee ~/.gan-zhong-xue/map.jsonl", "prefix:tee"),

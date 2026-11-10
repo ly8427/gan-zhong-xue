@@ -13,7 +13,7 @@
 #   * 只追加: 任何路径都只以追加方式打开——flock 快路径用 `cat >>`，
 #             python 核心用 'ab' 模式；代码里不存在截断/覆盖分支。
 #   * 写锁:   flock(1) 优先（纯 bash，不依赖 python）；无 flock(1) 时 exec
-#             python 核心 gzx-lock-append.py（fcntl/msvcrt，两平台标准库皆在）；
+#             python 核心 gzx_lock_append.py（fcntl/msvcrt，两平台标准库皆在）；
 #             flock 与 python 皆不可用 → 拒绝写并报错（退出码 22），绝不静默降级。
 #   * 四态退出码（thread #80 D2）:
 #       0  = 成功写入
@@ -21,7 +21,7 @@
 #       22 = 锁不可用（拒绝写，不静默降级）
 #       23 = 写失败（目录/磁盘/权限）
 #   * stderr 恒带一行 gzx-append: 开头的状态行；stdout 不出内容。
-#   * 不变量只有一份实现：flock 快路径之外，一切走 gzx-lock-append.py（两个入口无漂移）。
+#   * 不变量只有一份实现：flock 快路径之外，一切走 gzx_lock_append.py（两个入口无漂移）。
 #
 # 隐私（thread #80 D1）: 本脚本不解释内容、不落任何日志——写进文件的就是收到的字节。
 #   调用方保证内容已按隐私铁则脱敏（值域={脱敏文本(类型化占位符), 弃权串}）。
@@ -66,11 +66,11 @@ if command -v flock >/dev/null 2>&1; then
 fi
 
 # ── 路径 B：exec python 核心（Windows Git Bash 无 flock(1)）──────────
-# bash 找同目录的 gzx-lock-append.py；用到的 python 依次尝试 python3 / python。
+# bash 找同目录的 gzx_lock_append.py；用到的 python 依次尝试 python3 / python。
 # Windows 上 python 是原生程序：路径先经 cygpath 转 Windows 形态再传（MSYS 形态它不认）。
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
-CORE="$SELF_DIR/gzx-lock-append.py"
-[ -f "$CORE" ] || CORE="$GZX_DIR/gzx-lock-append.py"
+CORE="$SELF_DIR/gzx_lock_append.py"
+[ -f "$CORE" ] || CORE="$GZX_DIR/gzx_lock_append.py"
 
 for PY in python3 python; do
   if command -v "$PY" >/dev/null 2>&1 && "$PY" -c "import sys" 2>/dev/null; then

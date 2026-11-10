@@ -25,7 +25,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 SKILL_DIR = os.path.join(REPO, "skills", "gan-zhong-xue")
 WRITER_SH = os.path.join(SKILL_DIR, "gzx-append.sh")
-CORE_PY = os.path.join(SKILL_DIR, "gzx-lock-append.py")
+CORE_PY = os.path.join(SKILL_DIR, "gzx_lock_append.py")
 GUARD = os.path.join(HERE, "gzx-guard.py")
 CAPTURE = os.path.join(HERE, "gzx-capture.py")
 

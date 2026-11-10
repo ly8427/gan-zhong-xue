@@ -232,9 +232,16 @@ sub-agent**，它**只看最终 diff / 代码，不看本次开发的对话历�
 ```bash
 mkdir -p ~/.gan-zhong-xue && chmod 700 ~/.gan-zhong-xue 2>/dev/null   # 建目录 + 收紧权限（只自己可读写）
 [ -s ~/.gan-zhong-xue/pending.md ] && cat ~/.gan-zhong-xue/pending.md && echo "↑ 上次没挖完，先问用户要不要接着挖"
-# 写入器自检（v1.0.9 D2/Q4）：存在性 + 试写临时目录，失败明说（不静默降级）
+# 写入器引导安装（v1.1.0 P1-1）：数据目录缺写入器时，从本文件所在目录部署。
+# <SKILL_DIR> 由模型替换为本 SKILL.md 所在目录（本文件就在那里面，模型必然知道）。
+# 守卫对"cp 写入器进数据目录 / mkdir / chmod 数据目录"三类引导操作放行。
 GZX_APP=~/.gan-zhong-xue/gzx-append.sh
-if [ ! -f "$GZX_APP" ]; then echo "⚠ 写入器 gzx-append.sh 缺失（应随插件分发、与 SKILL.md 同目录）——先修安装，数据面暂无机制保护"; fi
+if [ ! -f "$GZX_APP" ]; then
+  cp "<SKILL_DIR>/gzx-append.sh" "$GZX_APP" && cp "<SKILL_DIR>/gzx_lock_append.py" ~/.gan-zhong-xue/ \
+    && echo "写入器已从技能目录部署" \
+    || echo "⚠ 写入器缺失：请把 SKILL.md 同目录的 gzx-append.sh 与 gzx_lock_append.py 复制到 ~/.gan-zhong-xue/ 后重试"
+fi
+# 写入器自检（v1.0.9 D2/Q4）：存在性 + 试写临时目录，失败明说（不静默降级）
 TMPD=$(mktemp -d 2>/dev/null) && { echo ok | GZX_DIR="$TMPD" bash "$GZX_APP" pending >/dev/null 2>&1 \
   && echo "写入器自检：通过" || echo "⚠ 写入器自检失败——写保护未生效，向用户明说再用"; rm -rf "$TMPD"; }
 # 提交捕获台账（v1.0.9 C'）：只提醒，不打扰——挖不挖由用户定
@@ -534,7 +541,9 @@ git diff HEAD~1 --stat 2>/dev/null   # 或让用户指定 commit / 一段 staged
 
 ### 第 4 步：中断即存档（真实工作随时打断学习，是常态不是 bug）
 学习和任务会互相打断（干到一半想学 / 学到一半想起要干活，两个方向都会）。任一方向被打断：
-- 立刻把**还没挖的点 + 当前挖到哪**用 `>>` **追加**进 `~/.gan-zhong-xue/pending.md`（不覆盖；**脱敏，只记抽象概念**）。
+- 立刻把**还没挖的点 + 当前挖到哪**经**写入器**追加进 `~/.gan-zhong-xue/pending.md`
+  （`~/.gan-zhong-xue/gzx-append.sh pending <<'PENDING_EOF' … PENDING_EOF`；不覆盖；**脱敏，只记抽象概念**。
+  v1.1.0 P1-3：手工 `>>` 直写同样违规——pending 与 map 同走写入器，append-only 由构造保证）。
 - 下次第 -1 步会先读它、提醒用户。**绝不让"想挖的点"默默消失**——那是真机那次最痛的教训。
 - 一句话确认即可："先去忙，这几个点我记下了，下次开头提醒你。"
 
