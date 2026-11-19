@@ -218,6 +218,13 @@ def main():
             ln = ln.strip()
             if ln and not ln.startswith("#"):
                 cmds.append(ln.replace("<SKILL_DIR>", "/tmp/gzx-fake-skill-dir"))
+    # 抽取器变换清单（board #122 dsh #2675 §2，写死防误读）：
+    #   {fence dedent（隐含于 splitlines+strip）, CRLF→LF, `<SKILL_DIR>` 占位符替换}
+    # ——占位符字面含 <>，会被分词器切进重定向层使段长 ≠ 3（prefix:cp 假红），
+    #   故替换是验收前提；断言占位符无残留（合法的 2>/dev/null 类重定向不算）。
+    bad_xform = [c for c in cmds if "<SKILL_DIR" in c]
+    check("G1a 抽取器变换后无 <SKILL_DIR> 占位符残留", not bad_xform,
+          "; ".join(repr(c) for c in bad_xform))
     bad = [(c, gdoc.classify(c)) for c in cmds if not gdoc.classify(c).allow]
     check("G1 第 -1 步文档字节逐条 classify 全 allow", not bad,
           "; ".join("%r -> %s" % (c, d.rule) for c, d in bad))
@@ -286,6 +293,14 @@ def main():
           and gdoc.classify("~/.gan-zhong-xue/gzx-append.sh map <<'E'\n## 概念\nE\n").rule.startswith("writer-heredoc"))
     check("G14 定界符行后两个换行 → deny（只放一个）",
           not gdoc.classify("~/.gan-zhong-xue/gzx-append.sh map <<'E'\n## 概念\nE\n\n").allow)
+    # G15:dsh #2675 §5 请有 shell 方补的一格——<SKILL_DIR> 字面形状 deny、替换后 allow
+    check("G15a <SKILL_DIR> 占位符字面 → deny（占位符不可直接执行）",
+          not gdoc.classify("cp <SKILL_DIR>/gzx-append.sh ~/.gan-zhong-xue/gzx-append.sh").allow)
+    check("G15b 占位符替换成实路径 → allow（G1 已覆盖,此处单独钉）",
+          gdoc.classify("cp /tmp/gzx-fake-skill-dir/gzx-append.sh ~/.gan-zhong-xue/gzx-append.sh").allow)
+    check("G16 正文多 CR（E\\r\\r）+ 其后接 rm → deny（r7 全剥 CR 后唯一性破）",
+          not gdoc.classify("~/.gan-zhong-xue/gzx-append.sh map <<'E'\nE\r\r\n"
+                            "rm ~/.gan-zhong-xue/map.md\nE").allow)
 
     print("\\n%s：%d 项失败" % ("FAILED" if FAILS else "ALL PASS", len(FAILS)))
     return 1 if FAILS else 0

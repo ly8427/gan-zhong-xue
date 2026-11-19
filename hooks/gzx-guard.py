@@ -216,14 +216,13 @@ def classify(cmd):
     if m:
         delim = m.group(4)
         lines = cmd.split("\n")                      # B4：只按 \n 切
-        # r6（grok #2670 两条实跑）：① 每行去**恰好一个**末尾 \r——Git Bash
-        # (MSYS bash) 把 `E\r` 当定界符行终结 heredoc、其后的行照跑（文档点名的
-        # 无 flock 兜底环境），不认 \r 就是 fail-open；② 定界符行后**恰好一个**
-        # 换行仍 allow（文档围栏原文自带末尾 \n），多于一个空行 = 末行不是定界符
-        # → 照旧 deny（定界符后接命令也照旧 deny）。
+        # r7（grok #2674 实跑）：Git Bash 对定界符行末尾 \r 不止容忍一个——
+        # N=1..8 全部终结 heredoc、其后行照跑 → 剥**全部**末尾 \r（不是恰好一个）。
+        # ② 定界符行后**恰好一个**换行仍 allow（文档围栏原文自带末尾 \n），多于
+        # 一个空行 = 末行不是定界符 → 照旧 deny（定界符后接命令也照旧 deny）。
         if lines and lines[-1] == "":
             lines = lines[:-1]
-        lines = [l[:-1] if l.endswith("\r") else l for l in lines]
+        lines = [l.rstrip("\r") for l in lines]
         if [i for i, l in enumerate(lines) if l == delim] != [len(lines) - 1]:
             return Decision(False, "heredoc:delim_repeats")   # B3：唯一且末行
         first = lines[0]
@@ -454,6 +453,9 @@ def selftest():
          "heredoc:writer_identity"),
         # r6 负向(grok #2670 实跑)：正文 `E\r` 在 Git Bash 是定界符行、其后 rm 照跑
         ("~/.gan-zhong-xue/gzx-append.sh map <<'E'\nE\r\nrm ~/.gan-zhong-xue/map.md\nE",
+         "heredoc:delim_repeats"),
+        # r7 负向(grok #2674 实跑)：两个及以上末尾 \r 同样终结 heredoc → 必拒
+        ("~/.gan-zhong-xue/gzx-append.sh map <<'E'\nE\r\r\nrm ~/.gan-zhong-xue/map.md\nE",
          "heredoc:delim_repeats"),
         ("cat x > ~/.gan-zhong-xue/map.jsonl", "redirect"),                     # #815 §3
         ("cp ~/.gan-zhong-xue/map.md /tmp/evil.md", "prefix:cp"),               # V1.1.0:拷数据出受保护目录仍拦
