@@ -168,16 +168,30 @@ def _seg_is_bootstrap(seg):
     return False
 
 
-# V1.1.1（board #122 M2-ext）writer-heredoc 例外：整条命令 = 「写入器路径 target
-# <<定界符 \n 正文 \n 定界符」形状。SKILL.md 的正式保存（:492/:504/:545）正是这个
-# 形状——换行在结构拒集里（多行命令一律拒），若不认 heredoc，主写路径在钩子接线后
-# 必被拦死（host 2026-11-20 classify 实证）。安全性：bash 语义下 heredoc 正文只进
-# 命令的 stdin、永不被 shell 解释；末行锚定保证定界符之后不能再接命令（接了就匹配
-# 失败、落回换行拒）；首行仍走完整判定（结构层 + 写入器身份）。非写入器头的
-# heredoc 不在例外内，照旧拒。
+# V1.1.1（board #122 M2-ext，r4 按 grok #2661 + dsh #2662/#2663 六条绑定重写）：
+# writer-heredoc 例外 = SKILL.md 正式保存的形状（写入器路径 target <<'定界符'）。
+# 六条绑定（全部可进 --selftest）：
+#   B1 只认**带引号**定界符（<<'X' / <<"X"）——未引号时 bash 会展开正文里的
+#      $(…)/${…}，「正文是数据」的前提不成立（grok #2661 实跑 HEAD：未引号+
+#      $(echo pwn) 当时 allow=True，那是本例外之前的既有漏，由 B2 修）；
+#      未加引号与 <<- 一律不进例外（<<- 不支持，fail-closed）。
+#   B2 结构层「token 含换行即拒」——punctuation_chars 会把连续标点粘成单 token
+#      （如 `\n$(…)`），精确等于 \n 的旧口径被粘接躲过；含换行就拒，不枚举粘接。
+#   B3 定界符**唯一且位于末行**（split("\n") 后等于定界符的行恰好是最后一行）——
+#      挡「正文提前出现同形行 → bash 提前终结 → 后续行被执行」（SKILL.md 原
+#      残余风险段记载的形状；例外挂上后后果从脏数据升级为命令执行）。
+#   B4 切行只按 raw.split("\n")，不用 splitlines()/split()（unicode 行分隔符
+#      与 bash 认知不一致，两个方向都会错）。
+#   B5 首行只认**一个** heredoc 算子（token 相等判 <<，禁子串；<<< 是 herestring
+#      无正文不进本例外路径，单行 writer 调用走原 allow 逻辑）。
+#   B6 例外 allow 用独立 rule 名 writer-heredoc:<正文字节数>b 落审计（活体证明，
+#      #811① 同源；仍不落命令原文）。
+# 安全依据：带引号定界符的正文在 bash 语义下只进写入器 stdin、永不解释；写入器
+# 自身不变量（只收 1 个 target 参、五个常量目标，gzx-append.sh:38-47）⇒ 首行
+# 无路径写能力，判「写入器身份 + target」即够（dsh #2662 §4）。
 _HEREDOC_WRITER_RE = re.compile(
     r"^[ \t]*(\S*gzx-append\.sh)[ \t]+(map|jsonl|pending|candidates|audit)"
-    r"[ \t]+<<-?[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\3\n((?:.*\n)?)\4[ \t]*$",
+    r"[ \t]+<<[ \t]*(['\"])([A-Za-z_][A-Za-z0-9_]*)\3\n((?:.*\n)?)\4$",
     re.DOTALL,
 )
 
@@ -188,11 +202,24 @@ def classify(cmd):
     if PROTECTED_MARK not in cmd:
         return Decision(True, "out-of-scope")
 
-    # writer-heredoc 例外（V1.1.1，见 _HEREDOC_WRITER_RE 注）：只判首行，
-    # 正文按数据处理。首行判定不过 → 原样返回它的 deny。
-    if _HEREDOC_WRITER_RE.match(cmd):
-        first = classify(cmd.split("\n", 1)[0])
-        return first if not first.allow else Decision(True, "writer-heredoc")
+    # writer-heredoc 例外（V1.1.1，绑定 B1/B3/B4/B5/B6；B2 在下方 token 循环）：
+    # 正文按数据处理不扫描；首行仍走完整判定（结构层 + 写入器身份）。
+    m = _HEREDOC_WRITER_RE.match(cmd)
+    if m:
+        delim = m.group(4)
+        lines = cmd.split("\n")                      # B4：只按 \n 切
+        if [i for i, l in enumerate(lines) if l == delim] != [len(lines) - 1]:
+            return Decision(False, "heredoc:delim_repeats")   # B3：唯一且末行
+        first = lines[0]
+        toks, tok_err = _structure_tokens(first)
+        if tok_err or sum(1 for t in toks if t == "<<") != 1 \
+                or any(t.startswith("<<") and t != "<<" for t in toks):
+            return Decision(False, "heredoc:operator")        # B5：单算子，token 相等
+        d1 = classify(first)                         # 首行完整判定（结构层+身份）
+        if not d1.allow:
+            return d1
+        return Decision(True, "writer-heredoc:%dB"   # B6：独立 rule 名 + 正文字节数
+                        % len(m.group(5).encode("utf-8")))
 
     toks, err = _structure_tokens(cmd)
     if err:
@@ -204,8 +231,11 @@ def classify(cmd):
     n = len(toks)
     while i < n:
         t = toks[i]
-        if t in STRUCTURE_DENY_TOKENS:
-            return Decision(False, "structure:" + t.replace("\n", "\\n"))
+        # B2（board #122/grok #2661）：punctuation_chars 会把连续标点粘成单 token
+        # （如 `\n$(…)`、`)\n`）——精确等于 \n 的旧口径被粘接躲过（未引号 heredoc
+        # 正文 $(…) 展开实跑 allow）。含换行即拒，不枚举粘接组合。
+        if t in STRUCTURE_DENY_TOKENS or "\n" in t:
+            return Decision(False, "structure:" + t.replace("\n", "\\n")[:24])
         if t in PIPE_TOKENS:
             segments.append([])
             i += 1
@@ -359,6 +389,7 @@ def selftest():
         ("~/.gan-zhong-xue/gzx-append.sh pending <<'PENDING_EOF'\n"
          "- 未挖点: 示例\n"
          "PENDING_EOF"),
+        "~/.gan-zhong-xue/gzx-append.sh jsonl <<< '{\"id\":2}'",   # B5 旁注:herestring 无正文,单行走原 allow
     ]
     denies = [
         # V1.1.1(board #122 M2):豁免收紧后的负向用例(dsh #2654 §3/§4 实证形状)
@@ -376,6 +407,15 @@ def selftest():
          "structure"),
         ("GZX_APP=~/.gan-zhong-xue/gzx-append.sh", "prefix:gzx-append.sh"),  # 赋值行假绿(dsh §4)
         ("mkdir -p ~/.gan-zhong-xue && chmod 700 ~/.gan-zhong-xue", "structure"),  # 复合引导仍拒
+        # B1/B2 负向(grok #2661 实跑 HEAD 曾 allow)：未引号定界符 + $(…) —— B2 修复后必拒
+        ("~/.gan-zhong-xue/gzx-append.sh map <<EOF\n$(echo pwn)\nEOF", "structure"),
+        # B3 负向(dsh #2662 §1 形状)：正文提前出现同形定界符行 → bash 提前终结、后行被执行
+        ("~/.gan-zhong-xue/gzx-append.sh map <<'E'\nhello\nE\nrm ~/.gan-zhong-xue/map.md\nE",
+         "heredoc:delim_repeats"),
+        # B1 负向：<<- 不进例外（fail-closed，不支持——计划已写死）
+        ("~/.gan-zhong-xue/gzx-append.sh map <<-'E'\nx\nE", "structure"),
+        # B5 负向：双算子落不进例外 → 换行拒
+        ("~/.gan-zhong-xue/gzx-append.sh map <<'A' <<'B'\nx\nA", "structure"),
         ("cat x > ~/.gan-zhong-xue/map.jsonl", "redirect"),                     # #815 §3
         ("cp ~/.gan-zhong-xue/map.md /tmp/evil.md", "prefix:cp"),               # V1.1.0:拷数据出受保护目录仍拦
         ("cat ~/.gan-zhong-xue/map.md > ~/.gan-zhong-xue/map.jsonl", "redirect"),

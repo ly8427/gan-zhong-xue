@@ -230,7 +230,9 @@ def main():
     import textwrap
     save_cmds = []
     for blk in re.findall(r"```bash\n(.*?)```", skill_md, re.S):
-        lines = textwrap.dedent(blk).splitlines()
+        # CRLF 归一是抽取器的责任、不是判据的例外（board #122 dsh #2662 §3）——
+        # 工作树可能是 CRLF，bash 只认 \n，喂 classify 前必须归一
+        lines = textwrap.dedent(blk).replace("\r\n", "\n").replace("\r", "\n").splitlines()
         i = 0
         while i < len(lines):
             m = re.match(r"^\s*~/.gan-zhong-xue/gzx-append\.sh (map|jsonl|pending) <<'([A-Za-z_]\w*)'\s*$",
@@ -261,6 +263,12 @@ def main():
           not gdoc.classify('TMPD=$(mktemp -d 2>/dev/null) && { echo ok | GZX_DIR="$TMPD" '
                             'bash "$HOME/.gan-zhong-xue/gzx-append.sh" pending >/dev/null 2>&1 ; '
                             'rm -rf "$TMPD" ; }').allow)
+    # G8/G9:六条绑定里 grok #2661 实跑曾 allow 的既有漏 + dsh #2662 §1 提前终结形状
+    check("G8 未引号定界符+$(…) 正文 → deny（B2 修粘接漏）",
+          not gdoc.classify("~/.gan-zhong-xue/gzx-append.sh map <<EOF\n$(echo pwn)\nEOF").allow)
+    check("G9 正文提前出现同形定界符行 → deny（B3）",
+          not gdoc.classify("~/.gan-zhong-xue/gzx-append.sh map <<'E'\nhello\nE\n"
+                            "rm ~/.gan-zhong-xue/map.md\nE").allow)
 
     print("\\n%s：%d 项失败" % ("FAILED" if FAILS else "ALL PASS", len(FAILS)))
     return 1 if FAILS else 0
