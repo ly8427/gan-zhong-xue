@@ -41,7 +41,9 @@
 
 import json
 import os
+import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -49,8 +51,13 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "..", "skills", "gan-zhong-xue"))
 try:
-    from gzx_lock_append import lock_append   # 写入器不变量核心（唯一实现）
+    # 写入器不变量核心（唯一实现）；_normalize_dir 供路径身份判定做跨形态换算
+    from gzx_lock_append import lock_append, _normalize_dir
 except ImportError:
+    try:
+        from gzx_lock_append import _normalize_dir
+    except ImportError:
+        _normalize_dir = None
     lock_append = None
 
 GZX_DIR = os.environ.get("GZX_DIR", os.path.expanduser("~/.gan-zhong-xue"))
@@ -95,9 +102,30 @@ def _structure_tokens(cmd):
         return None, "unparseable"
 
 
+def _canon_path(p):
+    """路径解析身份的统一口径（board #122 dsh §4）：expanduser → 跨形态换算
+    （POSIX python 收到 /c|/mnt/c 形态、Windows python 收到盘符形态，见
+    gzx_lock_append._normalize_dir）→ normcase(realpath)。"""
+    p = os.path.expanduser(p)
+    if _normalize_dir is not None:
+        p = _normalize_dir(p)
+    return os.path.normcase(os.path.realpath(p))
+
+
+def _writer_installed_path():
+    """写入器的唯一合法安装位（数据目录里的 gzx-append.sh）。"""
+    return _canon_path(os.path.join(GZX_DIR, "gzx-append.sh"))
+
+
 def _is_writer_token(tok):
-    base = tok.rsplit("/", 1)[-1]
-    return base == WRITER_MARK or base == WRITER_MARK + ".sh"
+    # V1.1.1（board #122 M2/dsh §4）：身份 = 解析后路径 == 安装常量。
+    # 旧口径（basename 相等即真）是绕过原语：/tmp/x/gzx-append 内容任意也放行。
+    # PATH 直调先经 shutil.which 解析；名字先筛一层（名字都不像就不必解析）。
+    base = tok.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    if base not in (WRITER_MARK, WRITER_MARK + ".sh"):
+        return False
+    cand = os.path.expanduser(tok)
+    return _canon_path(shutil.which(cand) or cand) == _writer_installed_path()
 
 
 def _seg_head_is_allowed(seg):
@@ -114,20 +142,44 @@ def _seg_head_is_allowed(seg):
 # V1.1.0（P1-2 引导豁免）：首次安装需要把写入器部署进数据目录并初始化权限——
 # 这三段操作若被守卫拦下，新用户永远装不起来（GPT PR #4 审查 P1-2 实景）。
 # 豁免口径（减速带定位内、逐段可判定）：
-#   cp/install —— 仅当段内出现写入器文件名 token（部署写入器本体）；
+#   cp/install —— V1.1.1 收紧（board #122 M2/dsh §3）：恰 2 参 ∧ 源 basename ∈
+#     {gzx-append.sh, gzx_lock_append.py} ∧ 目标 dirname 解析后 == GZX_DIR。
+#     旧口径（段内含 gzx-append 子串即豁免）可被 `cp /tmp/gzx-append map.md`
+#     一条绕过（append-only 变提示词可达，dsh #2654 §3 实证）。
 #   mkdir/chmod —— 仅当段内引用受保护目录本身（mkdir -p / chmod 700 初始化）。
-# 已接受的余量：chmod 数值不做白名单（用户对自己的数据目录有权变更权限）。
-BOOTSTRAP_CP_MARK = "gzx-append"
-BOOTSTRAP_SETUP = {"mkdir", "chmod"}
+# 已接受的余量：chmod 数值不做白名单（用户对自己的数据目录有权变更权限）；
+#   把真写入器复制成数据目录内的别名（如 .bak）仍放行——内容是写入器本体，
+#   不是任意载荷（selftest 在案）。
+_BOOTSTRAP_SRC_NAMES = {"gzx-append.sh", "gzx_lock_append.py"}
+_BOOTSTRAP_SETUP = {"mkdir", "chmod"}
 
 
 def _seg_is_bootstrap(seg):
     head = seg[0].rsplit("/", 1)[-1]
     if head in ("cp", "install"):
-        return any(BOOTSTRAP_CP_MARK in t for t in seg[1:])
-    if head in BOOTSTRAP_SETUP:
+        if len(seg) != 3:
+            return False
+        src = seg[1].rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        dst_dir = os.path.dirname(os.path.expanduser(seg[2]))
+        return (src in _BOOTSTRAP_SRC_NAMES
+                and _canon_path(dst_dir) == _canon_path(GZX_DIR))
+    if head in _BOOTSTRAP_SETUP:
         return any(PROTECTED_MARK in t for t in seg[1:])
     return False
+
+
+# V1.1.1（board #122 M2-ext）writer-heredoc 例外：整条命令 = 「写入器路径 target
+# <<定界符 \n 正文 \n 定界符」形状。SKILL.md 的正式保存（:492/:504/:545）正是这个
+# 形状——换行在结构拒集里（多行命令一律拒），若不认 heredoc，主写路径在钩子接线后
+# 必被拦死（host 2026-11-20 classify 实证）。安全性：bash 语义下 heredoc 正文只进
+# 命令的 stdin、永不被 shell 解释；末行锚定保证定界符之后不能再接命令（接了就匹配
+# 失败、落回换行拒）；首行仍走完整判定（结构层 + 写入器身份）。非写入器头的
+# heredoc 不在例外内，照旧拒。
+_HEREDOC_WRITER_RE = re.compile(
+    r"^[ \t]*(\S*gzx-append\.sh)[ \t]+(map|jsonl|pending|candidates|audit)"
+    r"[ \t]+<<-?[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\3\n((?:.*\n)?)\4[ \t]*$",
+    re.DOTALL,
+)
 
 
 def classify(cmd):
@@ -135,6 +187,12 @@ def classify(cmd):
     # 范围条件：不引用受保护目录 → 放行（D3：保守 deny 以引用受保护路径为条件）
     if PROTECTED_MARK not in cmd:
         return Decision(True, "out-of-scope")
+
+    # writer-heredoc 例外（V1.1.1，见 _HEREDOC_WRITER_RE 注）：只判首行，
+    # 正文按数据处理。首行判定不过 → 原样返回它的 deny。
+    if _HEREDOC_WRITER_RE.match(cmd):
+        first = classify(cmd.split("\n", 1)[0])
+        return first if not first.allow else Decision(True, "writer-heredoc")
 
     toks, err = _structure_tokens(cmd)
     if err:
@@ -282,8 +340,42 @@ def selftest():
         "cp ~/.gan-zhong-xue/gzx-append.sh ~/.gan-zhong-xue/gzx_lock_append.py.bak",
         "mkdir -p ~/.gan-zhong-xue",
         "chmod 700 ~/.gan-zhong-xue",
+        # V1.1.1(board #122 M1/M2):SKILL.md 第 -1 步改版后的单句引导与自检
+        "chmod +x ~/.gan-zhong-xue/gzx-append.sh",
+        "cp skills/gan-zhong-xue/gzx_lock_append.py ~/.gan-zhong-xue/gzx_lock_append.py",
+        "ls ~/.gan-zhong-xue/gzx-append.sh 2>/dev/null",
+        "cat ~/.gan-zhong-xue/pending.md 2>/dev/null",
+        "cat ~/.gan-zhong-xue/candidates.jsonl 2>/dev/null",
+        "~/.gan-zhong-xue/gzx-append.sh badtarget </dev/null",   # 直执行自检(rc21 不落盘)
+        # V1.1.1(M2-ext):writer-heredoc 例外——正式保存的文档原样形状
+        ("~/.gan-zhong-xue/gzx-append.sh map <<'GZX_MD_EOF'\n"
+         "## 概念示例\n"
+         "- 先猜: 保守假说\n"
+         "- 揭示: 实测修正\n"
+         "GZX_MD_EOF"),
+        ('~/.gan-zhong-xue/gzx-append.sh jsonl <<\'GZX_JSONL_EOF\'\n'
+         '{"id":1,"概念":"示例"}\n'
+         'GZX_JSONL_EOF'),
+        ("~/.gan-zhong-xue/gzx-append.sh pending <<'PENDING_EOF'\n"
+         "- 未挖点: 示例\n"
+         "PENDING_EOF"),
     ]
     denies = [
+        # V1.1.1(board #122 M2):豁免收紧后的负向用例(dsh #2654 §3/§4 实证形状)
+        ("cp /tmp/gzx-append ~/.gan-zhong-xue/map.md", "prefix:cp"),      # 源非写入器两件
+        ("cp /tmp/evil ~/.gan-zhong-xue/gzx-append.sh", "prefix:cp"),     # 覆盖写入器本体
+        ("cp a ~/.gan-zhong-xue/gzx-append.sh b", "prefix:cp"),           # 非 2 参不豁免
+        # M2-ext 负向:heredoc 例外不可被滥用
+        ("~/.gan-zhong-xue/gzx-append.sh map <<'E'\nx\nE\nrm ~/.gan-zhong-xue/map.md",
+         "structure"),                                                    # 定界符后接命令
+        ("cat > ~/.gan-zhong-xue/map.md <<'E'\nx\nE", "redirect"),        # 非写入器头 heredoc（重定向层先拦）
+        # M2:第 -1 步旧写法(分支/赋值)按新口径全部拒——文档已改单句,这里钉死不回潮
+        ("[ -s ~/.gan-zhong-xue/pending.md ]", "prefix:["),
+        ("test -s ~/.gan-zhong-xue/pending.md", "prefix:test"),
+        ("if [ -s ~/.gan-zhong-xue/map.jsonl ]; then cat ~/.gan-zhong-xue/map.jsonl; fi",
+         "structure"),
+        ("GZX_APP=~/.gan-zhong-xue/gzx-append.sh", "prefix:gzx-append.sh"),  # 赋值行假绿(dsh §4)
+        ("mkdir -p ~/.gan-zhong-xue && chmod 700 ~/.gan-zhong-xue", "structure"),  # 复合引导仍拒
         ("cat x > ~/.gan-zhong-xue/map.jsonl", "redirect"),                     # #815 §3
         ("cp ~/.gan-zhong-xue/map.md /tmp/evil.md", "prefix:cp"),               # V1.1.0:拷数据出受保护目录仍拦
         ("cat ~/.gan-zhong-xue/map.md > ~/.gan-zhong-xue/map.jsonl", "redirect"),

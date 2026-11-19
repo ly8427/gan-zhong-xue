@@ -16,6 +16,7 @@
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -198,6 +199,68 @@ def main():
               rr.stderr.decode("utf-8", "replace")[:300])
     with open(pend, encoding="utf-8") as f:
         check("F2 pending 内容在", "未挖点" in f.read())
+
+    # ---- G: 文档字节验收（board #122 M2/M2-ext：红绿两侧都钉在 SKILL.md 原文上，
+    # 不许用"实现者手写变体"当用例——dsh #2656 §3 / grok #2658 同款验收口径）----
+    # 独立守卫实例（默认 HOME 数据目录口径；classify 是纯函数，不写盘）
+    saved_gzx_dir = os.environ.pop("GZX_DIR", None)
+    spec3 = importlib.util.spec_from_file_location("gzx_guard_docbytes", GUARD)
+    gdoc = importlib.util.module_from_spec(spec3)
+    spec3.loader.exec_module(gdoc)
+    if saved_gzx_dir is not None:
+        os.environ["GZX_DIR"] = saved_gzx_dir
+
+    skill_md = open(os.path.join(SKILL_DIR, "SKILL.md"), encoding="utf-8").read()
+    step_m1 = skill_md.split("### 第 -1 步", 1)[1].split("\n### ", 1)[0]
+    cmds = []
+    for blk in re.findall(r"```bash\n(.*?)```", step_m1, re.S):
+        for ln in blk.splitlines():
+            ln = ln.strip()
+            if ln and not ln.startswith("#"):
+                cmds.append(ln.replace("<SKILL_DIR>", "/tmp/gzx-fake-skill-dir"))
+    bad = [(c, gdoc.classify(c)) for c in cmds if not gdoc.classify(c).allow]
+    check("G1 第 -1 步文档字节逐条 classify 全 allow", not bad,
+          "; ".join("%r -> %s" % (c, d.rule) for c, d in bad))
+    check("G2 第 -1 步文档命令数≥10（两个块都被抽到）", len(cmds) >= 10, "got %d" % len(cmds))
+
+    # 正式保存 heredoc：从全文 bash 围栏里逐字抽「写入器头 + 定界符终结」的完整命令。
+    # 围栏常在 markdown 列表内带缩进——那是排版缩进不是命令字节，真发给 shell 的
+    # 是 dedent 后的形态（bash 语义：空格缩进的定界符行不会终结 heredoc，守卫
+    # 正则因此保持严格，这里必须先 dedent 再喂——钉的就是模型实际会发的那串）。
+    import textwrap
+    save_cmds = []
+    for blk in re.findall(r"```bash\n(.*?)```", skill_md, re.S):
+        lines = textwrap.dedent(blk).splitlines()
+        i = 0
+        while i < len(lines):
+            m = re.match(r"^\s*~/.gan-zhong-xue/gzx-append\.sh (map|jsonl|pending) <<'([A-Za-z_]\w*)'\s*$",
+                         lines[i])
+            if m:
+                delim = m.group(2)
+                j = i + 1
+                while j < len(lines) and lines[j].strip() != delim:
+                    j += 1
+                if j < len(lines):
+                    save_cmds.append("\n".join(lines[i:j + 1]))
+                i = j
+            i += 1
+    bad = [(c.splitlines()[0].strip()[:44], gdoc.classify(c).rule)
+           for c in save_cmds if not gdoc.classify(c).allow]
+    check("G3 正式保存 heredoc 原文逐字 classify 全 allow（抽到≥2 处）",
+          len(save_cmds) >= 2 and not bad,
+          "saves=%d; %s" % (len(save_cmds), bad))
+
+    # 负向：M2 收紧后必须 deny（dsh #2654 §3/§4 实证形状）
+    check("G4 cp 假写入器覆盖 map.md → deny",
+          not gdoc.classify("cp /tmp/gzx-append ~/.gan-zhong-xue/map.md").allow)
+    check("G5 cp 任意文件覆盖写入器本体 → deny",
+          not gdoc.classify("cp /tmp/evil ~/.gan-zhong-xue/gzx-append.sh").allow)
+    trailing = "~/.gan-zhong-xue/gzx-append.sh map <<'E'\nx\nE\nrm ~/.gan-zhong-xue/map.md"
+    check("G6 heredoc 定界符后接命令 → deny", not gdoc.classify(trailing).allow)
+    check("G7 旧自检 bash 前缀+临时目录整段 → deny",
+          not gdoc.classify('TMPD=$(mktemp -d 2>/dev/null) && { echo ok | GZX_DIR="$TMPD" '
+                            'bash "$HOME/.gan-zhong-xue/gzx-append.sh" pending >/dev/null 2>&1 ; '
+                            'rm -rf "$TMPD" ; }').allow)
 
     print("\\n%s：%d 项失败" % ("FAILED" if FAILS else "ALL PASS", len(FAILS)))
     return 1 if FAILS else 0

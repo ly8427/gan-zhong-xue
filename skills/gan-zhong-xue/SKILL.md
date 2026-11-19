@@ -29,7 +29,8 @@ allowed-tools:
 > **v1.0.7 修"越问越不懂"（issue #2）——挖着挖着前置递归（架构→模板→语法→指针→∞），用户被拖离主线。A 类岔路加第二判两步测试（浅层语义够撑当前靶+深入不改变对靶的解释→外部前置搭桥放行；否则进图挖），map 新增 ⏸外部前置格（靶ID+关联节点，关系记录、先按靶调度、靶ID字面对应、随靶失效），补全学习边界（纵向别钻到晶体管、横向别追到整个语言体系）。**
 > **v1.0.8 修"委托型深渊"（issue #3）——用户只下高层指令、规则/协议/裁决文本由 agent 之间生成时，"先猜"的地基（用户在场过：写过/看过）塌了：让用户猜一本没读过的书 = 撞墙（真机复现：三轮两撞墙，用户原话"完全让我在乱猜啊"；仅补上材料原文，用户立即自己产出核心因果）。新增铁律11（委托靶，内容先行）+ 第 2 步入口发牌门（先问"原文当时看过吗"，宁可问不可猜；没看过先展示+共读原文再开问，发牌只给原文不预讲因果）+ 第 0 步协作工件靶类（无 diff，冷读输入换材料文本）。**
 > **v1.0.9 修"数据面只有文字约束"（board thread #80 定案 D1-D7）——双层机制落地：① **写入器 `gzx-append.sh`**（append-only 由构造保证：代码里只有追加分支、flock 写锁、锁不可用拒绝写不静默降级、四态退出码）——第 3 步两处 heredoc 改调写入器，append-only 从"模型自觉"变"机器不变量"；② **兜底 hook**（PreToolUse 减速带+审计：deny=写算子指向受保护路径，只读白名单放行，deny/allow 双侧审计且审计行不落命令原文）+ **提交静默捕获**（PostToolUse git commit → candidates.jsonl，去重键 (sha,event)，零打扰，提醒只在下次唤起兑现）；③ **自检分档**（8 条必答机械项 + CHECKLIST.md 按需读，D7）；④ **map 新格强制『先猜』字段**（"跳过先猜"从不可见变可 grep 追责）。matcher 是**待验证配置**（hooks/matcher.json，可达性矩阵实测后才算数，"装上即零配置"不进 README——D4）。**
-> **工作机上需要：本文件 + 写入器 `gzx-append.sh`（与本文件同目录，随插件分发）**（地图 `~/.gan-zhong-xue/` 首次跑自建；写入器首次运行自检存在性+试写，缺失/失败就明说，不静默降级）。
+> **v1.1.1 修"机制层自打"（board thread #122 定案 M1/M2/M2-ext）——守卫与文档互咬的三处断链：① **执行位**：引导块加单独一句 `chmod +x`（cp 不补执行位、旧自检走 bash 前缀查不出），自检改**直执行**（`badtarget` 空管道，rc=21 不落盘、对真实安装位断言）——「自检走宽容路径、生产走严格路径」的缺口模式根除；② **引导命令全部单句化**（守卫结构层拒一切复合命令与 `[`/`if`，判空改无条件 `cat … 2>/dev/null` 由模型判）；守卫同步收紧：cp/install 引导豁免限「源=写入器两件之一 ∧ 目标在数据目录内」、写入器身份改路径解析（basename 假绿是绕过原语，dsh #2654 §3/§4 实证）；③ **writer-heredoc 例外**：正式保存的 heredoc 形状被换行拒集误拦（主写路径断链，host classify 实证），守卫认「写入器头 + 定界符末行锚定」的 heredoc，正文按 stdin 数据处理。**
+> **工作机上需要：本文件 + 写入器 `gzx-append.sh`（与本文件同目录，随插件分发）**（地图 `~/.gan-zhong-xue/` 首次跑自建；写入器部署后过一次**直执行自检**，失败就明说，不静默降级）。
 > **哲学锚**：「知之为知之，不知为不知，是知也」/「绝知此事要躬行」/「少就是多」。
 > **语言**：输出跟随用户——中文用户用中文、英文用户用英文；规则本体与触发逻辑不变。
 
@@ -229,36 +230,31 @@ sub-agent**，它**只看最终 diff / 代码，不看本次开发的对话历�
 
 ### 第 -1 步：先读 pending + 地图（续传 + 跨时间裁判，都别跳）
 **只读、不写、不删、不迁移**。每次只读**瘦索引 `map.jsonl`**（够做命中检测 + 复验调度 + 概览，且不随地图膨胀爆 token）；**`map.md` 是细节库、不全读**——挖到某格才按需 grep 那一格（见下）。**判空 = jsonl 和 md 都空**才算第一次。
+**v1.1.1 命令形状纪律（board #122 定案）：守卫结构层拒绝一切复合命令（`&&`/`||`/`;`/命令替换）与 `[`/`if` 段首**——下面每条命令**单独发一次**；判空一律由你看 `cat` 的输出决定（无输出 = 文件不存在或为空），**不许写 `[ -s ]` 或 `if`**。
+
+**块 1（每次必跑，逐条发）**：
 ```bash
-mkdir -p ~/.gan-zhong-xue && chmod 700 ~/.gan-zhong-xue 2>/dev/null   # 建目录 + 收紧权限（只自己可读写）
-[ -s ~/.gan-zhong-xue/pending.md ] && cat ~/.gan-zhong-xue/pending.md && echo "↑ 上次没挖完，先问用户要不要接着挖"
-# 写入器引导安装（v1.1.0 P1-1）：数据目录缺写入器时，从本文件所在目录部署。
-# <SKILL_DIR> 由模型替换为本 SKILL.md 所在目录（本文件就在那里面，模型必然知道）。
-# 守卫对"cp 写入器进数据目录 / mkdir / chmod 数据目录"三类引导操作放行。
-GZX_APP=~/.gan-zhong-xue/gzx-append.sh
-if [ ! -f "$GZX_APP" ]; then
-  cp "<SKILL_DIR>/gzx-append.sh" "$GZX_APP" && cp "<SKILL_DIR>/gzx_lock_append.py" ~/.gan-zhong-xue/ \
-    && echo "写入器已从技能目录部署" \
-    || echo "⚠ 写入器缺失：请把 SKILL.md 同目录的 gzx-append.sh 与 gzx_lock_append.py 复制到 ~/.gan-zhong-xue/ 后重试"
-fi
-# 写入器自检（v1.0.9 D2/Q4）：存在性 + 试写临时目录，失败明说（不静默降级）
-TMPD=$(mktemp -d 2>/dev/null) && { echo ok | GZX_DIR="$TMPD" bash "$GZX_APP" pending >/dev/null 2>&1 \
-  && echo "写入器自检：通过" || echo "⚠ 写入器自检失败——写保护未生效，向用户明说再用"; rm -rf "$TMPD"; }
-# 提交捕获台账（v1.0.9 C'）：只提醒，不打扰——挖不挖由用户定
-[ -s ~/.gan-zhong-xue/candidates.jsonl ] && { echo "=== 提交捕获（还没挖的提交台账）==="; cat ~/.gan-zhong-xue/candidates.jsonl; echo "↑ 上次有提交没挖，问用户要不要挑一个挖"; }
-# 每次只读瘦索引 jsonl（不截断、旧格都能命中）；md 细节不全读、按需 grep（见下条）
-if [ -s ~/.gan-zhong-xue/map.jsonl ]; then
-  echo "=== 索引 map.jsonl（瘦、全量、坏行跳过）==="; cat ~/.gan-zhong-xue/map.jsonl
-elif [ -s ~/.gan-zhong-xue/map.md ]; then
-  echo "=== jsonl 空、md 有遗留（一次性兜底全读 md）==="; cat ~/.gan-zhong-xue/map.md
-else
-  echo "（jsonl 和 md 都空 = 第一次，本轮写第一格）"
-fi
+mkdir -p ~/.gan-zhong-xue
+chmod 700 ~/.gan-zhong-xue 2>/dev/null
+ls ~/.gan-zhong-xue/gzx-append.sh 2>/dev/null
+cat ~/.gan-zhong-xue/pending.md 2>/dev/null
+cat ~/.gan-zhong-xue/candidates.jsonl 2>/dev/null
+cat ~/.gan-zhong-xue/map.jsonl 2>/dev/null
 ```
+逐条读法：`ls` **有输出** = 写入器已部署 → 跳过块 2；**无输出** = 数据目录缺写入器 → 执行块 2。`pending` 有输出 = 上次没挖完，**先问用户要不要接着挖**；`candidates` 有输出 = 上次有提交没挖（台账行不删），问用户要不要挑一个挖；`map.jsonl` 有输出 = 索引在手（瘦、全量、坏行跳过）；**无输出** → 补一条 `cat ~/.gan-zhong-xue/map.md 2>/dev/null` 一次性兜底（遗留 md-only 格）；两者都空 = 第一次，本轮写第一格。
+
+**块 2（仅当块 1 的 `ls` 无输出——首次部署写入器）**：
+```bash
+cp <SKILL_DIR>/gzx-append.sh ~/.gan-zhong-xue/gzx-append.sh
+cp <SKILL_DIR>/gzx_lock_append.py ~/.gan-zhong-xue/gzx_lock_append.py
+chmod +x ~/.gan-zhong-xue/gzx-append.sh
+~/.gan-zhong-xue/gzx-append.sh badtarget </dev/null
+```
+`<SKILL_DIR>` 由模型替换为本 SKILL.md 所在目录（本文件就在那里面，模型必然知道）。守卫对「cp 写入器两件进数据目录 / mkdir / chmod 数据目录」放行（v1.1.1 收紧：cp 的源必须是 gzx-append.sh 或 gzx_lock_append.py、目标必须在数据目录内）。**末行 = 直执行自检（v1.1.1 M1，与正式保存同一调用形态、打真实安装位）**：应回 stderr `gzx-append: unknown target: badtarget` 且退出码 21、不写任何文件——报 Permission denied、或没有任何输出 = 部署失败，**向用户明说再用**（不静默降级）。
 - **提交捕获的兑现规则（v1.0.9 C'）**：台账行不删（append-only）；挖完的提交在下次开头口头确认"这条挖过了"即可，**用户的'不用挖了'同样只改口头、不动台账**（台账是 hook 的捕获记录，不是待办清单——待办语义在 pending）。
 - **回访率分母（D6）**：= 已展示给用户的候选数 + 最小样本量；candidates 行被读过且长出对应地图格才算一次回访。
 - **md 按需读、不全 cat**：`map.md` 是最胖的细节库，**别每次全读**（随地图膨胀会爆 token）。需要某一格细节（复验命中、或挖到它）时只读那一格，例如 `grep -F -A 8 -- '## <概念>' ~/.gan-zhong-xue/map.md`（`-F` 固定串——概念里的 `.`/`[` 不当正则；单引号防 `$(...)` 注入；`--` 防概念以 `-` 开头）。
-- **遗留 md-only 格子**（jsonl 空、只有 md，弱模型写的那种）→ 上面 elif 一次性兜底全读 md，不报空、不算丢；**不迁移、不解析 md 生成 jsonl**（会丢细节/出错）。注意：等 jsonl 有了新格之后，老的 md-only 格不再自动浮现（没丢、还在 md，需要时 grep）。
+- **遗留 md-only 格子**（jsonl 空、只有 md，弱模型写的那种）→ 块 1 里 `map.jsonl` 无输出时补发的那条 `cat ~/.gan-zhong-xue/map.md 2>/dev/null` 一次性兜底全读 md，不报空、不算丢；**不迁移、不解析 md 生成 jsonl**（会丢细节/出错）。注意：等 jsonl 有了新格之后，老的 md-only 格不再自动浮现（没丢、还在 md，需要时 grep）。
 - **jsonl 读到不认识的字段**（将来新版可能加）→ 忽略、别崩。**坏 JSON 行** → 跳过那一行、别整份丢弃。
 - **pending 非空**：先告诉用户"上次你说想挖 N 个、只挖了 M 个，还剩这些：…接着挖吗？"
   要 → 优先挖 pending。**不要 → 必须用户明确确认"这些不要了"才能清空 pending**（pending 是瞬态待办；清空只动 pending、**绝不碰 map.md/jsonl**；用户没确认就保留）。**绝不让想挖的点默默消失。**
@@ -581,7 +577,7 @@ git diff HEAD~1 --stat 2>/dev/null   # 或让用户指定 commit / 一段 staged
   与"从没触发"可区分（dsh #811①：本板自己吞过反斜杠、闸看起来跟通过一模一样的反例）。
 - **双向用例**：`python3 hooks/gzx-guard.py --selftest` 全绿——allow 侧 + deny 侧都要过
   （只验 deny 等于没验 allow，#815 §3）。
-- **写入器试写**：第 -1 步的写入器自检（存在性 + 试写临时目录 + 四态退出码核对）。
+- **写入器直执行自检**：第 -1 步块 2 末行（`~/.gan-zhong-xue/gzx-append.sh badtarget </dev/null`，对真实安装位直执行）——应回 `unknown target` + 退出码 21；四态退出码核对由不变量/集成套件覆盖（v1.1.1 M1：自检与正式保存同一调用形态，旧「bash 前缀 + 试写临时目录」口径作废）。
 
 **2. 运行健康度**（常态观察，异常才人工介入，无阈值失败线）：
 - 覆盖证据：candidates.jsonl 有行且时间戳推进（捕获活着，dsh #811④）；

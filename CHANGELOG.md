@@ -1,5 +1,39 @@
 # Changelog
 
+## v1.1.1 — 2026-11-20
+
+**board #122 评审收口：修"守卫与文档互咬"的三处断链（M1 执行位 / M2 引导豁免收紧 / M2-ext writer-heredoc）。评审带账项见 `docs/DEBT.md`（D1 tmp 泄漏、D2 双地图发散——带可执行验收，不挡合并）。**
+
+- **M1 执行位断链**：写入器两件在 git 树中均 100644，引导安装只 `cp` 不 `chmod`；
+  旧自检走 `bash` 前缀（不需要执行位）必过、正式保存按文档直执行必炸——每台
+  新机的确定性断链。修复：引导块加单独一句 `chmod +x`（不得写成 `cp && chmod`，
+  结构层会拒）；自检改**直执行**（`gzx-append.sh badtarget </dev/null` → rc=21
+  不落盘），与正式保存同一调用形态、对真实安装位断言（旧 `GZX_DIR=$TMPD`
+  临时目录口径作废——它从不触碰真实部署）。
+- **M2 引导命令单句化 + 守卫收紧**（grok #2653/#2658 实跑 + dsh #2654/#2656 读码）：
+  - SKILL.md 第 -1 步重写为单句命令：守卫结构层拒 `&&`/`||`/`;`/命令替换与
+    `[`/`if` 段首，判空改无条件 `cat … 2>/dev/null` 由模型判；`GZX_APP=` 赋值行
+    删除（受保护路径不做段首）。
+  - cp/install 引导豁免收紧：旧口径「段内含 `gzx-append` 子串即豁免」可被
+    `cp /tmp/gzx-append ~/.gan-zhong-xue/map.md` 一条绕过（append-only 变提示词
+    可达）；新口径 = 恰 2 参 ∧ 源 basename ∈ {gzx-append.sh, gzx_lock_append.py}
+    ∧ 目标 dirname 解析后 == 数据目录。
+  - 写入器身份收紧：`_is_writer_token` 从 basename 相等改为**路径解析身份**
+    （expanduser + shutil.which + normcase(realpath) == 数据目录/gzx-append.sh），
+    `/tmp/x/gzx-append` 假绿根除。
+  - py 核心部署顺带修通：旧豁免标记不含 `gzx_lock_append.py`，单句 `cp` 曾被拒。
+- **M2-ext writer-heredoc 例外**：分词器把换行当独立符号（拒集含 `\n`）⇒ 文档
+  教的 heredoc 多行保存命令（SKILL.md 第 3/4 步）在钩子接线后必被拦——**主写
+  路径断链**（host classify 实证，此前无人测过）。守卫新增例外：整条命令 =
+  「写入器路径 target <<定界符 … 定界符」形状（末行锚定）⇒ 只对首行做完整判定，
+  正文按 stdin 数据处理（bash 语义下永不解释）；定界符后接命令、非写入器头的
+  heredoc 照旧拒。
+- **验收绑文档字节**：集成测试 G 组（G1-G7）——抽取器从 SKILL.md 逐字取第 -1 步
+  命令与正式保存 heredoc 喂 `classify` 期望全 allow + 五条负向（两条 cp 绕过、
+  heredoc 后接命令、旧自检整段等）必 deny；`--selftest` 同步扩容。
+- **验证**：守卫 selftest（allow + deny 双侧）+ 不变量 + 集成（含 G 组）全绿，
+  见 PR 描述的证据段。
+
 ## v1.1.0 — 2026-11-11
 
 **GPT PR #4 审查收口：5×P1 + 3×P2 全部闭环——安装引导/守卫豁免/原子去重/失败提交不误记/集成测试入仓。**
