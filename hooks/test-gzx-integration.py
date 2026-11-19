@@ -269,6 +269,11 @@ def main():
     check("G9 正文提前出现同形定界符行 → deny（B3）",
           not gdoc.classify("~/.gan-zhong-xue/gzx-append.sh map <<'E'\nhello\nE\n"
                             "rm ~/.gan-zhong-xue/map.md\nE").allow)
+    # G10:假写入器路径(首行不含保护目录)——身份层直判,不许经 out-of-scope 短路
+    check("G10 /tmp 假写入器 + 正文提保护目录 → deny（身份层）",
+          not gdoc.classify("/tmp/evil/gzx-append.sh map <<'E'\n~/.gan-zhong-xue/map.md\nE").allow)
+    check("G11 相对路径假写入器 + 正文提保护目录 → deny（身份层）",
+          not gdoc.classify("./gzx-append.sh map <<'E'\n~/.gan-zhong-xue/map.md\nE").allow)
 
     print("\\n%s：%d 项失败" % ("FAILED" if FAILS else "ALL PASS", len(FAILS)))
     return 1 if FAILS else 0

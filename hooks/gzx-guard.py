@@ -189,6 +189,11 @@ def _seg_is_bootstrap(seg):
 # 安全依据：带引号定界符的正文在 bash 语义下只进写入器 stdin、永不解释；写入器
 # 自身不变量（只收 1 个 target 参、五个常量目标，gzx-append.sh:38-47）⇒ 首行
 # 无路径写能力，判「写入器身份 + target」即够（dsh #2662 §4）。
+# r5 身份判据两句（board #122 dsh #2668 §3，写死防再犯）：
+#   ① 身份 = _is_writer_token(writer_token) 为真——writer_token 取结构层 token
+#      流第 1 个 token（不是正则原文，引号信息在 token 层已被剥掉，dsh §2b）；
+#   ② classify(首行) 的 out-of-scope **不算**身份通过——首行判定全部内联，
+#      根本不调 classify，从根上排除「没进入判定」冒充「判定为写入器」。
 _HEREDOC_WRITER_RE = re.compile(
     r"^[ \t]*(\S*gzx-append\.sh)[ \t]+(map|jsonl|pending|candidates|audit)"
     r"[ \t]+<<[ \t]*(['\"])([A-Za-z_][A-Za-z0-9_]*)\3\n((?:.*\n)?)\4$",
@@ -203,7 +208,10 @@ def classify(cmd):
         return Decision(True, "out-of-scope")
 
     # writer-heredoc 例外（V1.1.1，绑定 B1/B3/B4/B5/B6；B2 在下方 token 循环）：
-    # 正文按数据处理不扫描；首行仍走完整判定（结构层 + 写入器身份）。
+    # r5 收口（grok #2667 + dsh #2668 §2/§3）：首行判定**全部内联、不递归
+    # classify**——递归会经 out-of-scope 短路（首行不含保护目录时），把「没进
+    # 入判定」错当「判定为写入器」。身份 = _is_writer_token(token 流第 1 个
+    # token) 直接判，False ⇒ heredoc:writer_identity 拒（独立 rule 名，B5）。
     m = _HEREDOC_WRITER_RE.match(cmd)
     if m:
         delim = m.group(4)
@@ -215,9 +223,22 @@ def classify(cmd):
         if tok_err or sum(1 for t in toks if t == "<<") != 1 \
                 or any(t.startswith("<<") and t != "<<" for t in toks):
             return Decision(False, "heredoc:operator")        # B5：单算子，token 相等
-        d1 = classify(first)                         # 首行完整判定（结构层+身份）
-        if not d1.allow:
-            return d1
+        i2 = 0
+        while i2 < len(toks):                        # 结构层 + 重定向层（内联，B2）
+            t = toks[i2]
+            if t in STRUCTURE_DENY_TOKENS or "\n" in t:
+                return Decision(False, "structure:" + t.replace("\n", "\\n")[:24])
+            if t in REDIRECT_TOKENS:
+                if i2 + 1 >= len(toks):
+                    return Decision(False, "redirect:missing-target")
+                tgt = toks[i2 + 1]
+                if not tgt.isdigit() and _is_protected(tgt):
+                    return Decision(False, "redirect-to-protected:" + t)
+                i2 += 2
+                continue
+            i2 += 1
+        if not _is_writer_token(toks[0]):            # 身份层：token 形态直判（dsh §2a/b）
+            return Decision(False, "heredoc:writer_identity")
         return Decision(True, "writer-heredoc:%dB"   # B6：独立 rule 名 + 正文字节数
                         % len(m.group(5).encode("utf-8")))
 
@@ -416,6 +437,11 @@ def selftest():
         ("~/.gan-zhong-xue/gzx-append.sh map <<-'E'\nx\nE", "structure"),
         # B5 负向：双算子落不进例外 → 换行拒
         ("~/.gan-zhong-xue/gzx-append.sh map <<'A' <<'B'\nx\nA", "structure"),
+        # B5 负向(grok #2667 实跑形状)：假写入器路径 + 正文提保护目录 —— 身份层必拒
+        ("/tmp/evil/gzx-append.sh map <<'E'\n~/.gan-zhong-xue/map.md\nE",
+         "heredoc:writer_identity"),
+        ("./gzx-append.sh map <<'E'\n~/.gan-zhong-xue/map.md\nE",
+         "heredoc:writer_identity"),
         ("cat x > ~/.gan-zhong-xue/map.jsonl", "redirect"),                     # #815 §3
         ("cp ~/.gan-zhong-xue/map.md /tmp/evil.md", "prefix:cp"),               # V1.1.0:拷数据出受保护目录仍拦
         ("cat ~/.gan-zhong-xue/map.md > ~/.gan-zhong-xue/map.jsonl", "redirect"),
