@@ -216,6 +216,14 @@ def classify(cmd):
     if m:
         delim = m.group(4)
         lines = cmd.split("\n")                      # B4：只按 \n 切
+        # r6（grok #2670 两条实跑）：① 每行去**恰好一个**末尾 \r——Git Bash
+        # (MSYS bash) 把 `E\r` 当定界符行终结 heredoc、其后的行照跑（文档点名的
+        # 无 flock 兜底环境），不认 \r 就是 fail-open；② 定界符行后**恰好一个**
+        # 换行仍 allow（文档围栏原文自带末尾 \n），多于一个空行 = 末行不是定界符
+        # → 照旧 deny（定界符后接命令也照旧 deny）。
+        if lines and lines[-1] == "":
+            lines = lines[:-1]
+        lines = [l[:-1] if l.endswith("\r") else l for l in lines]
         if [i for i, l in enumerate(lines) if l == delim] != [len(lines) - 1]:
             return Decision(False, "heredoc:delim_repeats")   # B3：唯一且末行
         first = lines[0]
@@ -410,6 +418,8 @@ def selftest():
         ("~/.gan-zhong-xue/gzx-append.sh pending <<'PENDING_EOF'\n"
          "- 未挖点: 示例\n"
          "PENDING_EOF"),
+        # r6 正向(grok #2670 条件②)：定界符行后恰好一个换行（围栏原文形状）仍 allow
+        "~/.gan-zhong-xue/gzx-append.sh map <<'E'\n## 概念\nE\n",
         "~/.gan-zhong-xue/gzx-append.sh jsonl <<< '{\"id\":2}'",   # B5 旁注:herestring 无正文,单行走原 allow
     ]
     denies = [
@@ -442,6 +452,9 @@ def selftest():
          "heredoc:writer_identity"),
         ("./gzx-append.sh map <<'E'\n~/.gan-zhong-xue/map.md\nE",
          "heredoc:writer_identity"),
+        # r6 负向(grok #2670 实跑)：正文 `E\r` 在 Git Bash 是定界符行、其后 rm 照跑
+        ("~/.gan-zhong-xue/gzx-append.sh map <<'E'\nE\r\nrm ~/.gan-zhong-xue/map.md\nE",
+         "heredoc:delim_repeats"),
         ("cat x > ~/.gan-zhong-xue/map.jsonl", "redirect"),                     # #815 §3
         ("cp ~/.gan-zhong-xue/map.md /tmp/evil.md", "prefix:cp"),               # V1.1.0:拷数据出受保护目录仍拦
         ("cat ~/.gan-zhong-xue/map.md > ~/.gan-zhong-xue/map.jsonl", "redirect"),

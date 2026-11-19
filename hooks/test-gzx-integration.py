@@ -243,7 +243,9 @@ def main():
                 while j < len(lines) and lines[j].strip() != delim:
                     j += 1
                 if j < len(lines):
-                    save_cmds.append("\n".join(lines[i:j + 1]))
+                    # 围栏原文含定界符行后的那个换行——逐字喂（grok #2670 条件②：
+                    # 围栏原文直接喂 classify 必须绿，不许用切行方式丢掉末尾换行）
+                    save_cmds.append("\n".join(lines[i:j + 1]) + "\n")
                 i = j
             i += 1
     bad = [(c.splitlines()[0].strip()[:44], gdoc.classify(c).rule)
@@ -274,6 +276,16 @@ def main():
           not gdoc.classify("/tmp/evil/gzx-append.sh map <<'E'\n~/.gan-zhong-xue/map.md\nE").allow)
     check("G11 相对路径假写入器 + 正文提保护目录 → deny（身份层）",
           not gdoc.classify("./gzx-append.sh map <<'E'\n~/.gan-zhong-xue/map.md\nE").allow)
+    # G12/G13:grok #2670 两条——Git Bash 把 `E\r` 当定界符行（其后行照跑）必须 deny；
+    # 定界符行后恰好一个换行（围栏原文形状）必须 allow
+    check("G12 正文 E\\r 终结 + 其后接 rm → deny（\\r 归一后唯一性破）",
+          not gdoc.classify("~/.gan-zhong-xue/gzx-append.sh map <<'E'\nE\r\n"
+                            "rm ~/.gan-zhong-xue/map.md\nE").allow)
+    check("G13 定界符行后恰好一个换行 → allow（围栏原文字节）",
+          gdoc.classify("~/.gan-zhong-xue/gzx-append.sh map <<'E'\n## 概念\nE\n").allow
+          and gdoc.classify("~/.gan-zhong-xue/gzx-append.sh map <<'E'\n## 概念\nE\n").rule.startswith("writer-heredoc"))
+    check("G14 定界符行后两个换行 → deny（只放一个）",
+          not gdoc.classify("~/.gan-zhong-xue/gzx-append.sh map <<'E'\n## 概念\nE\n\n").allow)
 
     print("\\n%s：%d 项失败" % ("FAILED" if FAILS else "ALL PASS", len(FAILS)))
     return 1 if FAILS else 0
