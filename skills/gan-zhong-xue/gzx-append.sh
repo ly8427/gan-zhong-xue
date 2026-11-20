@@ -46,7 +46,7 @@ case "$1" in
   pending)    TARGET="pending";    FILENAME="pending.md" ;;
   candidates) TARGET="candidates"; FILENAME="candidates.jsonl" ;;
   audit)      TARGET="audit";      FILENAME="audit.jsonl" ;;
-  pending-clear) CLEAR_PENDING=1 ;;
+  pending-clear) TARGET="pending"; FILENAME="pending.md"; CLEAR_PENDING=1 ;;
   *) fail 21 "unknown target: $1" ;;
 esac
 

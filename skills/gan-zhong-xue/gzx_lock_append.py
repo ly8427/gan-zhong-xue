@@ -157,6 +157,8 @@ def lock_truncate(gzx_dir, target):
     os.makedirs(gzx_dir, exist_ok=True)
     lockpath = os.path.join(gzx_dir, ".lock")
     targetpath = os.path.join(gzx_dir, TARGETS[target])
+    if not os.path.exists(targetpath):
+        return 0, "ok pending (already empty)"   # 缺文件=本就为空，与 flock 路径(: >)同语义
     try:
         with open(lockpath, "a+") as lf:
             _lock(lf)

@@ -181,23 +181,30 @@ def main():
     with open(worker_py, "w", encoding="utf-8") as f:
         f.write(worker_src)
 
-    def spawn_worker(row_obj):
-        pr = subprocess.Popen([sys.executable, worker_py],
-                              stdin=subprocess.PIPE, stderr=subprocess.PIPE,
-                              env=env)
-        _, err = pr.communicate(
-            (json.dumps(row_obj, ensure_ascii=False) + "\n").encode("utf-8"),
-            timeout=30)
-        return pr.returncode, err.decode("utf-8", "replace")
+    def spawn_workers(row_objs):
+        # Bugbot 二轮 Medium：先全部 Popen、后统一 communicate——工人真正
+        # 同时在跑，flock 争用才被测到（旧版边启边收=串行，无争用）。
+        procs = []
+        for row_obj in row_objs:
+            procs.append((subprocess.Popen([sys.executable, worker_py],
+                             stdin=subprocess.PIPE, stderr=subprocess.PIPE,
+                             env=env), row_obj))
+        outs = []
+        for pr, row_obj in procs:
+            _, err = pr.communicate(
+                (json.dumps(row_obj, ensure_ascii=False) + "\n").encode("utf-8"),
+                timeout=30)
+            outs.append((pr.returncode, err.decode("utf-8", "replace")))
+        return outs
 
     def cand_rows():
         return [json.loads(l) for l in open(cand, encoding="utf-8") if l.strip()]
 
-    # E1 并发争用（不同 sha）：两 worker 各自插入 → 两行都在
-    rcs = [spawn_worker({"sha": head + "-e1a", "add": 1, "del": 0,
-                         "event": "commit", "ts": "2026-11-11T00:00:00Z"}),
-           spawn_worker({"sha": head + "-e1b", "add": 2, "del": 0,
-                         "event": "commit", "ts": "2026-11-11T00:00:01Z"})]
+    # E1 并发争用（不同 sha）：两 worker 同时在跑 → 两行都在
+    rcs = spawn_workers([{"sha": head + "-e1a", "add": 1, "del": 0,
+                          "event": "commit", "ts": "2026-11-11T00:00:00Z"},
+                         {"sha": head + "-e1b", "add": 2, "del": 0,
+                          "event": "commit", "ts": "2026-11-11T00:00:01Z"}])
     check("E1a 两 worker 真跑了(rc=0)", all(rc == 0 for rc, _ in rcs),
           "rcs=%r" % (rcs,))
     got = sorted(r_["sha"] for r_ in cand_rows()
@@ -210,9 +217,9 @@ def main():
 
     # E3 同 sha 并发竞态：两 worker 同 sha → 零新增（去重原子性在争用下成立）
     before = len(cand_rows())
-    rcs = [spawn_worker({"sha": head, "add": 1, "del": 0,
-                         "event": "commit", "ts": "2026-11-11T00:00:00Z"})
-           for _ in range(2)]
+    rcs = spawn_workers([{"sha": head, "add": 1, "del": 0,
+                          "event": "commit", "ts": "2026-11-11T00:00:00Z"}
+                         for _ in range(2)])
     check("E3a 两 worker 真跑了(rc=0)", all(rc == 0 for rc, _ in rcs),
           "rcs=%r" % (rcs,))
     check("E3b 同 sha 并发零新增(去重原子)", len(cand_rows()) == before,
