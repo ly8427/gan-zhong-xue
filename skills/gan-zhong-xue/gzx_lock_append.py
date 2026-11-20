@@ -144,8 +144,43 @@ def lock_append_commit_unique(gzx_dir, data):
     return 0, "ok candidates (sha=%s, seq=%s)" % (str(row["sha"])[:12], row.get("seq"))
 
 
+def lock_truncate(gzx_dir, target):
+    """v1.1.2（Bugbot PR#4 High「pending 无法清空」）：锁内核截断目标文件。
+
+    **只许 pending**——pending 是瞬态待办（SKILL.md：用户明确确认后才清空、
+    只动 pending）；map/jsonl/candidates/audit 是 append-only 资产，
+    截断=破坏不变量，一律拒绝。这是 pending 的**唯一**清空通道：
+    协议不再让模型用 rm/重定向自清（守卫拦 + 绕锁），全部走本函数。"""
+    if target != "pending":
+        return 21, "truncate only allowed for pending (append-only assets never truncate)"
+    gzx_dir = _normalize_dir(gzx_dir)
+    os.makedirs(gzx_dir, exist_ok=True)
+    lockpath = os.path.join(gzx_dir, ".lock")
+    targetpath = os.path.join(gzx_dir, TARGETS[target])
+    try:
+        with open(lockpath, "a+") as lf:
+            _lock(lf)
+            try:
+                # 锁内截断：pending 唯一清空通道——不经过任何写模式打开，
+                # 静态围栏（不变量套件 B2/B3）锁定本函数为全文件唯一截断点；
+                # append-only 资产（map/jsonl/candidates/audit）永远到不了这里。
+                os.truncate(targetpath, 0)
+            finally:
+                lf.close()
+    except OSError as e:
+        return 23, "truncate failed: %s" % e
+    return 0, "ok pending (cleared)"
+
+
 def main():
     gzx_dir = os.environ.get("GZX_DIR", os.path.expanduser("~/.gan-zhong-xue"))
+    if len(sys.argv) == 3 and sys.argv[1] == "--truncate":
+        if sys.argv[2] != "pending":
+            sys.stderr.write("gzx-lock-append: --truncate only supports pending\n")
+            raise SystemExit(21)
+        rc, msg = lock_truncate(gzx_dir, "pending")
+        sys.stderr.write("gzx-append: %s\n" % msg)
+        raise SystemExit(rc)
     if len(sys.argv) != 2:
         sys.stderr.write("gzx-lock-append: usage <target>, stdin = content\n")
         raise SystemExit(21)

@@ -144,6 +144,19 @@ def test_append_only():
     src = open(CORE_PY, encoding="utf-8").read()
     check("B1 核心源码无截断打开（无 'w'/'wb' 模式）",
           "open(targetpath, \"w" not in src and "'w'" not in src and "'wb'" not in src)
+    # v1.1.2（Bugbot PR#4 High）：pending 唯一清空通道的静态围栏——
+    # os.truncate 恰 1 处、仅在 lock_truncate 内、带 pending-only 守卫。
+    # append-only 资产（map/jsonl/candidates/audit）永远到不了截断分支；
+    # bash 面的 ': > "pending"' 截断只服务 pending-clear 动词（B1b 白名单外
+    # 的 '> ' 仍由 B1b 的原断言与守卫结构层把关）。
+    lt_start = src.find("def lock_truncate")
+    lt_end = src.find("\ndef ", lt_start + 1)
+    lt = src[lt_start:lt_end if lt_end > 0 else len(src)]
+    check("B2 os.truncate 恰 1 处且仅在 lock_truncate 内",
+          src.count("os.truncate") == 1 and lt.count("os.truncate") == 1,
+          "count=%d lt=%d" % (src.count("os.truncate"), lt.count("os.truncate")))
+    check("B3 lock_truncate 带 pending-only 守卫",
+          "truncate only allowed for pending" in lt)
     sh = open(WRITER_SH, encoding="utf-8").read()
     check("B1b bash 面只有追加重定向（>> / cat >>）", "cat >> \"$1\"" in sh
           and "cat > \"$GZX_DIR" not in sh.replace("cat >> ", ""))

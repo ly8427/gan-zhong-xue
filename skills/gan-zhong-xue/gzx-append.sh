@@ -2,7 +2,10 @@
 # gzx-append.sh — gan-zhong-xue 数据写入器（v1.0.9，board thread #80 D2 定案）
 #
 # 用法: gzx-append.sh <target>          内容从 stdin 读入（管道/heredoc 均可）
-#   target ∈ {map|jsonl|pending|candidates|audit}
+#   target ∈ {map|jsonl|pending|candidates|audit|pending-clear}
+#     pending-clear → 清空 pending.md（v1.1.2，Bugbot PR#4 High：pending 唯一
+#                     清空通道，锁内核截断、只动 pending；无需 stdin。用户确认
+#                     规则在 SKILL.md——本命令不替代确认，只是确认后的执行面）
 #     map        → ~/.gan-zhong-xue/map.md           （永久记录，append-only）
 #     jsonl      → ~/.gan-zhong-xue/map.jsonl        （瘦索引，append-only）
 #     pending    → ~/.gan-zhong-xue/pending.md       （瞬态待办，追加）
@@ -43,8 +46,37 @@ case "$1" in
   pending)    TARGET="pending";    FILENAME="pending.md" ;;
   candidates) TARGET="candidates"; FILENAME="candidates.jsonl" ;;
   audit)      TARGET="audit";      FILENAME="audit.jsonl" ;;
+  pending-clear) CLEAR_PENDING=1 ;;
   *) fail 21 "unknown target: $1" ;;
 esac
+
+# ── pending-clear（v1.1.2）：锁内核截断 pending，绝不碰 map/jsonl ──
+# 与追加同一套锁纪律：flock 快路径 / python 核心二选一；皆不可用 → 拒绝（22），
+# 绝不静默降级成无锁清空。
+if [ "${CLEAR_PENDING:-0}" = "1" ]; then
+  mkdir -p "$GZX_DIR" 2>/dev/null || fail 23 "cannot create $GZX_DIR"
+  LOCKFILE="$GZX_DIR/.lock"
+  if command -v flock >/dev/null 2>&1; then
+    if flock -x "$LOCKFILE" sh -c ': > "$1"' sh "$GZX_DIR/$FILENAME" 2>/dev/null; then
+      echo "gzx-append: ok pending cleared" >&2
+      exit 0
+    fi
+    fail 23 "truncate failed (flock path): pending"
+  fi
+  SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+  CORE="$SELF_DIR/gzx_lock_append.py"
+  [ -f "$CORE" ] || CORE="$GZX_DIR/gzx_lock_append.py"
+  for PY in python3 python; do
+    if command -v "$PY" >/dev/null 2>&1 && "$PY" -c "import sys" 2>/dev/null; then
+      if command -v cygpath >/dev/null 2>&1; then
+        CORE="$(cygpath -w "$CORE")"
+        GZX_DIR="$(cygpath -w "$GZX_DIR")"
+      fi
+      GZX_DIR="$GZX_DIR" exec "$PY" "$CORE" --truncate pending
+    fi
+  done
+  fail 22 "no locking mechanism available (flock(1) and python both missing) — refusing to clear pending unprotected"
+fi
 
 # stdin 先落临时文件（写锁获取失败时不碰目标文件；空内容=误调用）
 TMP="$(mktemp "${TMPDIR:-/tmp}/gzx-append.XXXXXX")" || fail 23 "cannot create temp file"

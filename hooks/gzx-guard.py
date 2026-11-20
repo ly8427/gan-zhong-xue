@@ -404,6 +404,9 @@ def selftest():
         "ls ~/.gan-zhong-xue/gzx-append.sh 2>/dev/null",
         "cat ~/.gan-zhong-xue/pending.md 2>/dev/null",
         "cat ~/.gan-zhong-xue/candidates.jsonl 2>/dev/null",
+        # v1.1.2（Bugbot PR#4 High）：pending 唯一清空通道=写入器动词——两形态都放行
+        "~/.gan-zhong-xue/gzx-append.sh pending-clear",
+        "gzx-append pending-clear",
         "~/.gan-zhong-xue/gzx-append.sh badtarget </dev/null",   # 直执行自检(rc21 不落盘)
         # V1.1.1(M2-ext):writer-heredoc 例外——正式保存的文档原样形状
         ("~/.gan-zhong-xue/gzx-append.sh map <<'GZX_MD_EOF'\n"

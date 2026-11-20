@@ -165,27 +165,58 @@ def main():
                                         os.path.join(SKILL_DIR, "gzx_lock_append.py"))
     core = _iu.module_from_spec(spec2)
     spec2.loader.exec_module(core)
-    row = json.dumps({"sha": head, "add": 1, "del": 0, "event": "commit",
-                      "ts": "2026-11-11T00:00:00Z"}, ensure_ascii=False)
-    procs = []
-    for _ in range(2):
-        pr = subprocess.Popen([sys.executable, "-c",
-                               "import sys, json\\n"
-                               "sys.path.insert(0, r'" + SKILL_DIR + "')\\n"
-                               "import gzx_lock_append as c\\n"
-                               "rc, msg = c.lock_append_commit_unique("
-                               "r'" + gzx_dir + "', sys.stdin.read())\\n"
-                               "sys.stderr.write(str(rc))"],
-                              stdin=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
-        pr.stdin.write((row + "\\n").encode("utf-8"))
-        pr.stdin.close()
-        procs.append(pr)
-    for pr in procs:
-        pr.communicate(timeout=30)
-    rows = [json.loads(l) for l in open(cand, encoding="utf-8") if l.strip()]
-    check("E1 并发双进程同 sha 恰 1 行", len(rows) == 1, "got %d" % len(rows))
+    # 并发（v1.1.2 重写——Bugbot PR#4 Medium：旧版 worker 用 python -c 且换行
+    # 写成字面 \\n，两个进程直接 SyntaxError 全灭；D1 的旧行让断言空过，
+    # lock_append_commit_unique 的并发路径从未被测过。改为 worker 落临时
+    # 文件（真换行）+ 回收 rc 证明真跑了 + 争用断言真正咬合）。
+    worker_src = (
+        "import sys\n"
+        "sys.path.insert(0, r'" + SKILL_DIR + "')\n"
+        "import gzx_lock_append as c\n"
+        "rc, msg = c.lock_append_commit_unique(\n"
+        "    r'" + gzx_dir + "', sys.stdin.buffer.read())\n"
+        "sys.stderr.write(str(rc))\n"
+    )
+    worker_py = os.path.join(tempfile.mkdtemp(prefix="gzx_e1_"), "worker.py")
+    with open(worker_py, "w", encoding="utf-8") as f:
+        f.write(worker_src)
+
+    def spawn_worker(row_obj):
+        pr = subprocess.Popen([sys.executable, worker_py],
+                              stdin=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=env)
+        _, err = pr.communicate(
+            (json.dumps(row_obj, ensure_ascii=False) + "\n").encode("utf-8"),
+            timeout=30)
+        return pr.returncode, err.decode("utf-8", "replace")
+
+    def cand_rows():
+        return [json.loads(l) for l in open(cand, encoding="utf-8") if l.strip()]
+
+    # E1 并发争用（不同 sha）：两 worker 各自插入 → 两行都在
+    rcs = [spawn_worker({"sha": head + "-e1a", "add": 1, "del": 0,
+                         "event": "commit", "ts": "2026-11-11T00:00:00Z"}),
+           spawn_worker({"sha": head + "-e1b", "add": 2, "del": 0,
+                         "event": "commit", "ts": "2026-11-11T00:00:01Z"})]
+    check("E1a 两 worker 真跑了(rc=0)", all(rc == 0 for rc, _ in rcs),
+          "rcs=%r" % (rcs,))
+    got = sorted(r_["sha"] for r_ in cand_rows()
+                 if str(r_["sha"]).endswith(("-e1a", "-e1b")))
+    check("E1b 并发两行都在(锁串行化)", len(got) == 2, "got %r" % (got,))
+    rows = cand_rows()
     seqs = sorted(r_.get("seq") for r_ in rows)
-    check("E2 seq 连续(锁内现算)", seqs == [1])
+    check("E2 seq 全文件唯一且连续(锁内现算)",
+          seqs == list(range(1, len(rows) + 1)), "seqs=%r" % (seqs,))
+
+    # E3 同 sha 并发竞态：两 worker 同 sha → 零新增（去重原子性在争用下成立）
+    before = len(cand_rows())
+    rcs = [spawn_worker({"sha": head, "add": 1, "del": 0,
+                         "event": "commit", "ts": "2026-11-11T00:00:00Z"})
+           for _ in range(2)]
+    check("E3a 两 worker 真跑了(rc=0)", all(rc == 0 for rc, _ in rcs),
+          "rcs=%r" % (rcs,))
+    check("E3b 同 sha 并发零新增(去重原子)", len(cand_rows()) == before,
+          "新增 %d" % (len(cand_rows()) - before))
 
     # ---- F: pending 走写入器(P1-3) ----
     r = run_capture(env, {"tool_name": "Read"})  # 触发一次无关调用,确认 pending 仍空
@@ -199,6 +230,17 @@ def main():
               rr.stderr.decode("utf-8", "replace")[:300])
     with open(pend, encoding="utf-8") as f:
         check("F2 pending 内容在", "未挖点" in f.read())
+
+    # F3 pending 清空唯一通道（v1.1.2，Bugbot PR#4 High 端到端回归）：
+    # pending-clear 清空 pending.md；append-only 资产 candidates.jsonl 原样。
+    cand_before = open(cand, encoding="utf-8").read() if os.path.exists(cand) else ""
+    rr = subprocess.run([GITBASH, _posix(app_dst), "pending-clear"],
+                        capture_output=True, env=env, timeout=30)
+    check("F3a pending-clear rc=0（写入器动词放行且锁内截断）", rr.returncode == 0,
+          rr.stderr.decode("utf-8", "replace")[:200])
+    check("F3b pending.md 已空", os.path.getsize(pend) == 0)
+    check("F3c candidates.jsonl 原样（append-only 不受清空影响）",
+          (open(cand, encoding="utf-8").read() if os.path.exists(cand) else "") == cand_before)
 
     # ---- G: 文档字节验收（board #122 M2/M2-ext：红绿两侧都钉在 SKILL.md 原文上，
     # 不许用"实现者手写变体"当用例——dsh #2656 §3 / grok #2658 同款验收口径）----
