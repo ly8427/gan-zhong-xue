@@ -17,3 +17,4 @@ gan-zhong-xue-state/
 # Local test artifacts / scratch (reviewers' test harness, etc.) — never commit
 tmp/
 
+__pycache__/
