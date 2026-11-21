@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""test-gzx-integration.py — v1.1.0 集成回归（GPT PR #4 审查 P2-8：真实 Git 工作流）。
+"""test-gzx-integration.py — v1.1.2 集成回归（GPT PR #4 审查 P2-8：真实 Git 工作流）。
 
 覆盖（全部在隔离临时目录跑，绝不碰真实 ~/.gan-zhong-xue 或用户仓库）：
   A. 首次安装引导（P1-1）：数据目录无写入器 → 从技能目录复制 → 写入器可用

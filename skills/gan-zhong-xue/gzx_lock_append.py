@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""gzx-lock-append.py — 写入器不变量核心（v1.1.0，GPT round-18 P1-4/P2-7 收口）。
+"""gzx-lock-append.py — 写入器不变量核心（v1.1.2，board #122 r8 + GPT round-18 收口）。
 
-唯一实现"锁 + 只追加"的地方：gzx-append.sh（bash 面）与 hooks/ 的 python 调用方
-（gzx-guard / gzx-capture）都落到这里，保证两个入口没有第二份不变量实现（无漂移）。
+唯一实现"锁 + 追加（append-only 资产）"与"pending 清空（lock_truncate）"的地方：
+gzx-append.sh（bash 面）与 hooks/ 的 python 调用方（gzx-guard / gzx-capture）都落到
+这里，保证两个入口没有第二份不变量实现（无漂移）。
+
+v1.1.2（board #122 r8，pi #2737/#2776 第五版定版）: 新增 lock_truncate——pending
+唯一清空通道（锁内截断；append-only 资产显式拒绝；存在性检查在锁内）。
 
 用法: python3 gzx-lock-append.py <target>      内容从 stdin 读
   target ∈ {map|jsonl|pending|candidates|audit}
@@ -150,7 +154,8 @@ def lock_truncate(gzx_dir, target):
     **只许 pending**——pending 是瞬态待办（SKILL.md：用户明确确认后才清空、
     只动 pending）；map/jsonl/candidates/audit 是 append-only 资产，
     截断=破坏不变量，一律拒绝。这是 pending 的**唯一**清空通道：
-    协议不再让模型用 rm/重定向自清（守卫拦 + 绕锁），全部走本函数。"""
+    协议不再让模型用 rm/重定向自清（守卫拦 + 绕锁）；flock 快路径之外，
+    全部走本函数（dsh #2754 §3②：flock 臂 : > 的截断不经本函数，措辞随事实收窄）。"""
     if target != "pending":
         return 21, "truncate only allowed for pending (append-only assets never truncate)"
     gzx_dir = _normalize_dir(gzx_dir)

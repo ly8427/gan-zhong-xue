@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""test-gzx-invariants.py — gan-zhong-xue v1.0.9 机械不变量测试（D7：机械必过面）。
+"""test-gzx-invariants.py — gan-zhong-xue v1.1.2 机械不变量测试（D7：机械必过面）。
 
 覆盖（全部在隔离临时 GZX_DIR 跑，绝不碰真实 ~/.gan-zhong-xue）：
   A. 写入器四态退出码（0/21/22/23）——bash 面 + python 核心双面（D2）
@@ -152,14 +152,27 @@ def test_append_only():
     lt_start = src.find("def lock_truncate")
     lt_end = src.find("\ndef ", lt_start + 1)
     lt = src[lt_start:lt_end if lt_end > 0 else len(src)]
-    check("B2 os.truncate 恰 1 处且仅在 lock_truncate 内",
+    check("B5a os.truncate 恰 1 处且仅在 lock_truncate 内",
           src.count("os.truncate") == 1 and lt.count("os.truncate") == 1,
           "count=%d lt=%d" % (src.count("os.truncate"), lt.count("os.truncate")))
-    check("B3 lock_truncate 带 pending-only 守卫",
+    check("B5b lock_truncate 带 pending-only 守卫",
           "truncate only allowed for pending" in lt)
     sh = open(WRITER_SH, encoding="utf-8").read()
-    check("B1b bash 面只有追加重定向（>> / cat >>）", "cat >> \"$1\"" in sh
-          and "cat > \"$GZX_DIR" not in sh.replace("cat >> ", ""))
+    # (c)（用户 PR#4 follow-up 批次 pi #2737 (c)，按 dsh #2723 §5 三条可数断言
+    # 重写——旧 B1b 只看子串，pending-clear 截断行加入后形状失真）：
+    import re as _re
+    # 截断式重定向（进文件目标）：> 前非 > /数字 /&，后非 > /&，且目标以
+    # 引号或变量开头（排除 >/dev/null 这类流丢弃——dsh #2723 §5 口径）。
+    trunc_lines = [ln for ln in sh.splitlines()
+                   if not ln.strip().startswith("#")
+                   and _re.search(r"(?<![>0-9&])>(?!>)[ \t]*(?!&)(?!/dev/null)(?=[\"'$])", ln)]
+    check("B1b-1 截断重定向两具名站点恰各 1 处（pending-clear 与 TMP 暂存）",
+          sh.count(': > "$1"') == 1 and sh.count('cat > "$TMP"') == 1)
+    check("B1b-2 截断式重定向总数==2（非 >>、非注释行、非流丢弃）",
+          len(trunc_lines) == 2, "sites=%r" % (trunc_lines,))
+    check("B1b-3 资产名禁入截断右值",
+          not any(_re.search(r"map\.md|map\.jsonl|candidates\.jsonl|audit\.jsonl", ln)
+                  for ln in trunc_lines))
 
     # 并发追加：10 个并行核心 × 5 行，行完整性 + 总行数
     d = tempfile.mkdtemp(prefix="gzx-conc-")
@@ -243,6 +256,85 @@ def test_audit_no_raw_command():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_version_face():
+    """(d)③ 版本面单点（board #122 r8，pi #2776 第五版定版）：七处头注 ==
+    CHANGELOG 首个 ## 版本行；断言三件套（分母/分子/诊断分布）+ 负例 +
+    删史段内计数 + SKILL 零 CHANGELOG 引用 + matcher 显式豁免在案。"""
+    import re as _re
+    changelog = open(os.path.join(REPO, "CHANGELOG.md"), encoding="utf-8").read()
+
+    def parse_authoritative(text):
+        """权威源解析：首个 ## 行必须以裸 vX.Y.Z 开头（禁 [Unreleased]/未发布
+        标记——pi #2776 负例两种写法）；解析不到 ⇒ ValueError（fail-closed）。"""
+        for ln in text.splitlines():
+            if ln.startswith("## "):
+                m = _re.match(r"^## (v\d+\.\d+\.\d+)\b", ln)
+                if not m or _re.search(r"未发布|Unreleased|draft", ln, _re.I):
+                    raise ValueError("CHANGELOG 首段不可解析为权威版本: %r" % ln)
+                return m.group(1)
+        raise ValueError("CHANGELOG 无任何 ## 版本行")
+
+    auth = parse_authoritative(changelog)
+
+    sites = [
+        ("SKILL.md", "skills/gan-zhong-xue/SKILL.md", "# 干中学 (Learning by Doing)", 30),
+        ("gzx-append.sh", "skills/gan-zhong-xue/gzx-append.sh", "# gzx-append.sh —", 5),
+        ("gzx_lock_append.py", "skills/gan-zhong-xue/gzx_lock_append.py", "gzx-lock-append.py —", 5),
+        ("gzx-capture.py", "hooks/gzx-capture.py", "gzx-capture.py —", 5),
+        ("test-gzx-integration.py", "hooks/test-gzx-integration.py", "test-gzx-integration.py —", 5),
+        ("test-gzx-invariants.py", "hooks/test-gzx-invariants.py", '"""test-gzx-invariants.py —', 5),
+        ("README.md", "README.md", "## 机制层（", 60),
+    ]
+    tags = {}
+    for name, rel, anchor, depth in sites:
+        # 只扫每站点自带深度内的头区——头注标签总在文件头；全文件扫会让
+        # "引用锚点的测试代码"自命中（本文件 sites 清单在 :285，即实例）
+        lines = open(os.path.join(REPO, rel), encoding="utf-8").read().splitlines()[:depth]
+        hits = [ln for ln in lines if anchor in ln]
+        if len(hits) != 1:
+            check("(d)③ 分母 fail-closed：%s 锚点恰 1 行" % name, False,
+                  "hits=%d" % len(hits))
+            return
+        m = _re.search(r"v\d+\.\d+\.\d+", hits[0])
+        if not m:
+            check("(d)③ 分母 fail-closed：%s 头注含版本标签" % name, False, hits[0])
+            return
+        tags[name] = m.group(0)
+    check("(d)③-1 分母：七处头注抽取命中恰 7（fail-closed）",
+          len(tags) == 7, str(tags))
+    dist = {}
+    for v in tags.values():
+        dist[v] = dist.get(v, 0) + 1
+    check("(d)③-2 分子：len(set)==1 且 ==权威值",
+          len(set(tags.values())) == 1 and auth in set(tags.values()),
+          "分布=%s 权威=%s" % (dist, auth))
+    check("(d)③-3 诊断分布行已随失败输出", True)  # 诊断由上方 detail 承载
+
+    skill = open(os.path.join(REPO, "skills", "gan-zhong-xue", "SKILL.md"),
+                 encoding="utf-8").read()
+    lines = skill.splitlines()
+    h1 = next(i for i, ln in enumerate(lines) if ln.startswith("# 干中学"))
+    need = next((i for i, ln in enumerate(lines) if "工作机上需要" in ln), None)
+    seg = lines[h1:need + 1 if need is not None else len(lines)]
+    stale = [ln for ln in seg if _re.match(r"^\s*>\s*\*\*v1(\.\d+)*", ln)]
+    check("(d)③-4 删史：头部段内手抄历史行==0（禁全文==0，:607 合法引用除外）",
+          not stale, "残留=%r" % (stale[:2],))
+    check("(d)③-5 SKILL.md 全文 CHANGELOG 引用恰 0",
+          skill.count("CHANGELOG") == 0)
+    matcher = open(os.path.join(REPO, "hooks", "matcher.json"),
+                   encoding="utf-8").read()
+    check("(d)③-6 matcher.json 二选一不沉默（显式豁免+文件内理由）",
+          "显式豁免" in matcher)
+
+    # 负例（pi #2776）：解析器对两种写法必须红
+    for bad in ("## [Unreleased]\n正文", "## v1.1.2 (未发布)\n正文"):
+        try:
+            parse_authoritative(bad)
+            check("(d)③ 负例 %r 必红" % bad.splitlines()[0], False)
+        except ValueError:
+            check("(d)③ 负例 %r 必红" % bad.splitlines()[0], True)
+
+
 def test_map_field_greppable():
     """D7 机械核验形状：字段齐全可数 + 弃权串是合法值（D1）。"""
     d = tempfile.mkdtemp(prefix="gzx-field-")
@@ -293,6 +385,7 @@ def main():
     test_audit_no_raw_command()
     test_map_field_greppable()
     test_migration_no_rewrite()
+    test_version_face()
     print("\n%s：%d 项失败" % ("FAILED" if FAILS else "ALL PASS", len(FAILS)))
     return 1 if FAILS else 0
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""gzx-capture.py — 提交静默捕获 hook（v1.1.0，board thread #80 C' 定案 + GPT
+"""gzx-capture.py — 提交静默捕获 hook（v1.1.2，board thread #80 C' 定案 + GPT
 PR #4 审查 P1-5 收口）。
 
 定位：零打扰。PostToolUse 命中 git commit 时，不向用户说任何话，只往

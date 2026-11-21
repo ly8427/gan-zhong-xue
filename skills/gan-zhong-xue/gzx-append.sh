@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gzx-append.sh — gan-zhong-xue 数据写入器（v1.0.9，board thread #80 D2 定案）
+# gzx-append.sh — gan-zhong-xue 数据写入器（v1.1.2，board thread #80 D2 定案 + #122 r8）
 #
 # 用法: gzx-append.sh <target>          内容从 stdin 读入（管道/heredoc 均可）
 #   target ∈ {map|jsonl|pending|candidates|audit|pending-clear}
@@ -13,8 +13,10 @@
 #     audit      → ~/.gan-zhong-xue/audit.jsonl      （hook 审计台账，hook 专用）
 #
 # 不变量（由构造保证，不靠模型自觉）:
-#   * 只追加: 任何路径都只以追加方式打开——flock 快路径用 `cat >>`，
-#             python 核心用 'ab' 模式；代码里不存在截断/覆盖分支。
+#   * 只追加: map/jsonl/candidates/audit 四资产任何路径都只以追加方式打开——
+#             flock 快路径用 `cat >>`，python 核心用 'ab' 模式。
+#             唯一例外 = pending-clear（锁内截断 pending.md，瞬态待办，见下）；
+#             截断分支全文件仅此一处（不变量套件 B1b/B2 静态锁定）。
 #   * 写锁:   flock(1) 优先（纯 bash，不依赖 python）；无 flock(1) 时 exec
 #             python 核心 gzx_lock_append.py（fcntl/msvcrt，两平台标准库皆在）；
 #             flock 与 python 皆不可用 → 拒绝写并报错（退出码 22），绝不静默降级。
@@ -38,7 +40,7 @@ fail() {  # fail <exit-code> <message>
   exit "$1"
 }
 
-[ $# -eq 1 ] || fail 21 "usage: gzx-append.sh <map|jsonl|pending|candidates|audit> (stdin = content)"
+[ $# -eq 1 ] || fail 21 "usage: gzx-append.sh <map|jsonl|pending|candidates|audit|pending-clear> (stdin = content; pending-clear 无需 stdin)"
 
 case "$1" in
   map)        TARGET="map";        FILENAME="map.md" ;;
@@ -54,6 +56,8 @@ esac
 # 与追加同一套锁纪律：flock 快路径 / python 核心二选一；皆不可用 → 拒绝（22），
 # 绝不静默降级成无锁清空。
 if [ "${CLEAR_PENDING:-0}" = "1" ]; then
+  # pending-only 守卫（用户 PR#4 follow-up P1 批次 pi #2737 (b)：不成立即 fail 21）
+  [ "$FILENAME" = "pending.md" ] || fail 21 "clear only allowed for pending"
   mkdir -p "$GZX_DIR" 2>/dev/null || fail 23 "cannot create $GZX_DIR"
   LOCKFILE="$GZX_DIR/.lock"
   if command -v flock >/dev/null 2>&1; then

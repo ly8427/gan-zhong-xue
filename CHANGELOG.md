@@ -1,5 +1,22 @@
 # Changelog
 
+## v1.1.2 — 2026-11-21
+
+**board #122 r8 修复批次（pi #2737/#2776 第五版定版）+ 用户 PR#4 follow-up（P1/P2）+ Bugbot 两轮五项。**
+
+- **pending 唯一清空通道**：写入器新增 `pending-clear` 动词（锁内核截断，flock /
+  python 核心 `--truncate pending` 双路径同语义；缺文件=本就为空，存在性检查
+  在锁内——用户 follow-up P1 竞态收口）；append-only 资产
+  （map/jsonl/candidates/audit）到不了截断分支（lock_truncate 显式拒绝 21）。
+- **静态围栏**：不变量套件新增 B2（截断调用恰 1 处且仅在 lock_truncate 内）、
+  B3（pending-only 守卫在位）、B1b 三条可数断言（截断重定向恰两具名站点/
+  总数钉死/资产名禁入右值）；版本面单点断言三件套（七处头注==权威值）。
+- **并发测试重写真跑**：worker 落临时文件（真换行）、回收 rc、先全启后统收
+  （真争用）——E1 两行都在 / E2 seq 唯一连续 / E3 同 sha 零新增。
+- **用户 follow-up**：P2 发布元数据同步（marketplace 1.0.8→1.1.1→1.1.2 与
+  plugin.json 一致，新增双文件一致性灯）；M3 机械版端到端验收（隔离 HOME
+  按文档安装→写入→读回→错误路径）。
+
 ## v1.1.1 — 2026-11-20
 
 **board #122 评审收口：修"守卫与文档互咬"的三处断链（M1 执行位 / M2 引导豁免收紧 / M2-ext writer-heredoc）。评审带账项见 `docs/DEBT.md`（D1 tmp 泄漏、D2 双地图发散——带可执行验收，不挡合并）。**
