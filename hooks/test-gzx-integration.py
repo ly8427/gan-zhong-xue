@@ -249,6 +249,19 @@ def main():
     check("F3c candidates.jsonl 原样（append-only 不受清空影响）",
           (open(cand, encoding="utf-8").read() if os.path.exists(cand) else "") == cand_before)
 
+    # P2（用户 PR#4 follow-up）：插件版本双文件一致性——plugin.json 与
+    # marketplace.json 条目版本不得漂移（1.0.8 vs 1.1.1 曾静默并存）。
+    pj = json.load(open(os.path.join(REPO, ".claude-plugin", "plugin.json"),
+                        encoding="utf-8"))
+    mj = json.load(open(os.path.join(REPO, ".claude-plugin", "marketplace.json"),
+                        encoding="utf-8"))
+    plugs = mj.get("plugins") or []
+    mv = next((p_.get("version") for p_ in plugs
+               if p_.get("name") == pj.get("name")), None)
+    check("P2 插件版本双文件一致",
+          mv == pj.get("version"),
+          "plugin.json=%s marketplace.json=%s" % (pj.get("version"), mv))
+
     # ---- G: 文档字节验收（board #122 M2/M2-ext：红绿两侧都钉在 SKILL.md 原文上，
     # 不许用"实现者手写变体"当用例——dsh #2656 §3 / grok #2658 同款验收口径）----
     # 独立守卫实例（默认 HOME 数据目录口径；classify 是纯函数，不写盘）

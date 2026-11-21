@@ -157,12 +157,15 @@ def lock_truncate(gzx_dir, target):
     os.makedirs(gzx_dir, exist_ok=True)
     lockpath = os.path.join(gzx_dir, ".lock")
     targetpath = os.path.join(gzx_dir, TARGETS[target])
-    if not os.path.exists(targetpath):
-        return 0, "ok pending (already empty)"   # 缺文件=本就为空，与 flock 路径(: >)同语义
     try:
         with open(lockpath, "a+") as lf:
             _lock(lf)
             try:
+                # 存在性检查在锁内（用户 PR#4 follow-up P1：锁外检查+返回成功的
+                # 竞态=clear 报成功而另一进程刚锁内追加的内容残留不截断）。
+                # 缺文件=本就为空，与 flock 路径(: >)同语义。
+                if not os.path.exists(targetpath):
+                    return 0, "ok pending (already empty)"
                 # 锁内截断：pending 唯一清空通道——不经过任何写模式打开，
                 # 静态围栏（不变量套件 B2/B3）锁定本函数为全文件唯一截断点；
                 # append-only 资产（map/jsonl/candidates/audit）永远到不了这里。
