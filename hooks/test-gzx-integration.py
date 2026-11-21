@@ -258,9 +258,20 @@ def main():
     plugs = mj.get("plugins") or []
     mv = next((p_.get("version") for p_ in plugs
                if p_.get("name") == pj.get("name")), None)
-    check("P2 插件版本双文件一致",
-          mv == pj.get("version"),
-          "plugin.json=%s marketplace.json=%s" % (pj.get("version"), mv))
+    # GPT 外审(grok #2812 flip 条件): 双文件互等但≠权威解析值必绿(1.1.1==1.1.1
+    # 假绿)——P2 改为「两文件相等 且 == CHANGELOG 首个 ## vX.Y.Z 解析值」。
+    chg_authority = None
+    with open(os.path.join(REPO, "CHANGELOG.md"), encoding="utf-8") as _cf:
+        for _ln in _cf:
+            _m = re.match(r"^## (v\d+\.\d+\.\d+)", _ln)
+            if _m:
+                chg_authority = _m.group(1)
+                break
+    check("P2 插件版本双文件一致且等于 CHANGELOG 权威值",
+          mv == pj.get("version")
+          and pj.get("version") == (chg_authority or "").lstrip("v"),
+          "plugin.json=%s marketplace.json=%s CHANGELOG=%s"
+          % (pj.get("version"), mv, chg_authority))
 
     # ---- G: 文档字节验收（board #122 M2/M2-ext：红绿两侧都钉在 SKILL.md 原文上，
     # 不许用"实现者手写变体"当用例——dsh #2656 §3 / grok #2658 同款验收口径）----
