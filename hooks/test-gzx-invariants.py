@@ -335,6 +335,35 @@ def test_version_face():
             check("(d)③ 负例 %r 必红" % bad.splitlines()[0], True)
 
 
+def test_capture_exception_silent_by_default():
+    """GPT 外审(PR#4 五轮): 默认异常路径真静默——无 stderr traceback、
+    不创建 capture-trace.txt;RG_CAPTURE_DEBUG 开启才输出诊断。"""
+    d = tempfile.mkdtemp(prefix="gzx-cap-neg-")
+    ev = json.dumps({"tool_name": "Bash",
+                     "tool_input": {"command": "git status"},
+                     "cwd": os.getcwd(),
+                     "tool_response": {"output": "x"}}).encode()
+    # 默认(无 RG_CAPTURE_DEBUG): 喂非法载荷迫使异常路径,stdout/stderr 应全空
+    r1 = subprocess.run([sys.executable, CAPTURE], env=dict(os.environ, GZX_DIR=d),
+                        input=b"not-json-at-all", capture_output=True, timeout=30)
+    check("capture 异常默认路径 rc=0 且 stdout 空(旁路不阻塞)",
+          r1.returncode == 0 and r1.stdout == b"",
+          "rc=%r out=%r" % (r1.returncode, r1.stdout[:60]))
+    check("capture 异常默认路径 stderr 无 traceback(RG_CAPTURE_DEBUG 未开)",
+          b"Traceback" not in r1.stderr and b"capture-debug" not in r1.stderr,
+          "stderr=%r" % r1.stderr[:80])
+    check("capture 异常默认路径不创建 capture-trace.txt",
+          not os.path.exists(os.path.join(d, "capture-trace.txt")),
+          str(sorted(os.listdir(d))))
+    # 开关开启: 诊断可见(行为面验证 RG_CAPTURE_DEBUG 生效)
+    r2 = subprocess.run([sys.executable, CAPTURE],
+                        env=dict(os.environ, GZX_DIR=d, RG_CAPTURE_DEBUG="1"),
+                        input=b"not-json-at-all", capture_output=True, timeout=30)
+    check("RG_CAPTURE_DEBUG=1 时异常诊断可见(开关生效)",
+          r2.returncode == 0 and b"capture-debug" in r2.stderr,
+          "stderr=%r" % r2.stderr[:80])
+
+
 def test_map_field_greppable():
     """D7 机械核验形状：字段齐全可数 + 弃权串是合法值（D1）。"""
     d = tempfile.mkdtemp(prefix="gzx-field-")

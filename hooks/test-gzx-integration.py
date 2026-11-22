@@ -182,19 +182,31 @@ def main():
         f.write(worker_src)
 
     def spawn_workers(row_objs):
-        # Bugbot 二轮 Medium：先全部 Popen、后统一 communicate——工人真正
-        # 同时在跑，flock 争用才被测到（旧版边启边收=串行，无争用）。
+        # GPT 外审(PR#4 五轮): 旧版先全部 Popen、后逐个 communicate——第二个
+        # worker 的 stdin 没数据、阻塞在读入口，实际串行，测不到 flock 争用
+        # (旧注释自称"真正同时在跑"与事实相反)。修法=每个 worker 预写输入
+        # 文件、以文件句柄为 stdin、全部启动后统一 wait，真并发。
         procs = []
         for row_obj in row_objs:
-            procs.append((subprocess.Popen([sys.executable, worker_py],
-                             stdin=subprocess.PIPE, stderr=subprocess.PIPE,
-                             env=env), row_obj))
+            infile = tempfile.NamedTemporaryFile(
+                "wb", prefix="gzx-e2e-", suffix=".json", delete=False)
+            infile.write((json.dumps(row_obj, ensure_ascii=False) + "\n").encode("utf-8"))
+            infile.close()
+            stdin_fh = open(infile.name, "rb")
+            pr = subprocess.Popen([sys.executable, worker_py],
+                                  stdin=stdin_fh, stderr=subprocess.PIPE,
+                                  env=env)
+            stdin_fh.close()  # 子进程持有自己的句柄副本,父侧即可关闭
+            procs.append((pr, infile.name))
         outs = []
-        for pr, row_obj in procs:
-            _, err = pr.communicate(
-                (json.dumps(row_obj, ensure_ascii=False) + "\n").encode("utf-8"),
-                timeout=30)
+        for pr, _infile in procs:
+            _, err = pr.communicate(timeout=30)
             outs.append((pr.returncode, err.decode("utf-8", "replace")))
+        for _, infile_name in procs:
+            try:
+                os.unlink(infile_name)
+            except OSError:
+                pass
         return outs
 
     def cand_rows():

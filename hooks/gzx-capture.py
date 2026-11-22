@@ -148,15 +148,19 @@ def main():
             subprocess.run([sys.executable, core, "candidates"], input=data,
                            capture_output=True, timeout=20)
     except Exception as _e:
-        try:
-            import traceback as _tb
-            _t = _tb.format_exc()
-            sys.stderr.write("[capture-debug] exception:\n%s\n" % _t)
-            with open(os.path.join(GZX_DIR, "capture-trace.txt"), "a",
-                      encoding="utf-8") as _f:
-                _f.write("EXCEPTION %s\n" % _t)
-        except Exception:
-            pass
+        # GPT 外审(PR#4 五轮): 默认路径必须真静默(零 stderr、不写 trace 文件)
+        # ——traceback 可能含本机绝对路径,与最小化记录原则不一致;诊断只在
+        # RG_CAPTURE_DEBUG 显式开启时输出(与 _dbg 同一开关)。
+        if os.environ.get("RG_CAPTURE_DEBUG"):
+            try:
+                import traceback as _tb
+                _t = _tb.format_exc()
+                sys.stderr.write("[capture-debug] exception:\n%s\n" % _t)
+                with open(os.path.join(GZX_DIR, "capture-trace.txt"), "a",
+                          encoding="utf-8") as _f:
+                    _f.write("EXCEPTION %s\n" % _t)
+            except Exception:
+                pass
     finally:
         sys.exit(0)
 
