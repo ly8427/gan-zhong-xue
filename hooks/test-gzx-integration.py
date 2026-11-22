@@ -182,22 +182,31 @@ def main():
         f.write(worker_src)
 
     def spawn_workers(row_objs):
-        # GPT 外审(PR#4 五轮): 旧版先全部 Popen、后逐个 communicate——第二个
-        # worker 的 stdin 没数据、阻塞在读入口，实际串行，测不到 flock 争用
-        # (旧注释自称"真正同时在跑"与事实相反)。修法=每个 worker 预写输入
-        # 文件、以文件句柄为 stdin、全部启动后统一 wait，真并发。
+        # GPT 外审(PR#4 六轮): 光"预写 stdin 文件"仍非确定性——worker 启动时刻
+        # 由 OS 调度,争用可能不发生。加同步屏障:每个 worker 先自旋等放行文件,
+        # 全部就位后测试统一放行 ⇒ 争用确定性发生(flock 必被同刻争抢)。
+        barrier = os.path.join(tempfile.mkdtemp(prefix="gzx-e2e-bar-"), "GO")
+        bootstrap = (
+            "import os, sys, time, runpy\n"
+            "bar, worker, data = sys.argv[1], sys.argv[2], sys.argv[3]\n"
+            "while not os.path.exists(bar):\n"
+            "    time.sleep(0.005)\n"
+            "sys.argv = [worker, data]\n"
+            "sys.stdin = open(data, 'r', newline='')\n"
+            "runpy.run_path(worker, run_name='__main__')\n")
         procs = []
         for row_obj in row_objs:
             infile = tempfile.NamedTemporaryFile(
                 "wb", prefix="gzx-e2e-", suffix=".json", delete=False)
             infile.write((json.dumps(row_obj, ensure_ascii=False) + "\n").encode("utf-8"))
             infile.close()
-            stdin_fh = open(infile.name, "rb")
-            pr = subprocess.Popen([sys.executable, worker_py],
-                                  stdin=stdin_fh, stderr=subprocess.PIPE,
-                                  env=env)
-            stdin_fh.close()  # 子进程持有自己的句柄副本,父侧即可关闭
+            pr = subprocess.Popen(
+                [sys.executable, "-c", bootstrap, barrier, worker_py, infile.name],
+                stdin=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env)
             procs.append((pr, infile.name))
+        # 全部 worker 已在屏障前自旋——放行,真并发开始
+        with open(barrier, "w") as _g:
+            _g.write("go")
         outs = []
         for pr, _infile in procs:
             _, err = pr.communicate(timeout=30)
@@ -207,6 +216,10 @@ def main():
                 os.unlink(infile_name)
             except OSError:
                 pass
+        try:
+            shutil.rmtree(os.path.dirname(barrier), ignore_errors=True)
+        except OSError:
+            pass
         return outs
 
     def cand_rows():
