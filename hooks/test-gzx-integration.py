@@ -335,16 +335,25 @@ def main():
         for ln in blk.splitlines():
             ln = ln.strip()
             if ln and not ln.startswith("#"):
-                cmds.append(ln.replace("<SKILL_DIR>", "'" + _posix(SKILL_DIR) + "'"))
+                # r15(Bugbot 4668735266):替换值**不加引号**——文档 cp 命令自 r14 起自带
+                # 引号（`cp '<SKILL_DIR>/...'`），抽取器再包一层得 `''路径''`：空格落在
+                # 引号外，带空格路径照样被拆词（bash/shlex 同判）⇒ G1 假红。文档引号即
+                # 空格保护，替换只做纯字面替换。
+                cmds.append(ln.replace("<SKILL_DIR>", _posix(SKILL_DIR)))
     # 抽取器变换清单（board #122 dsh #2675 §2，写死防误读）：
-    #   {fence dedent（隐含于 splitlines+strip）, CRLF→LF, `<SKILL_DIR>` 占位符替换}
-    #   r14(Bugbot "spaced installs"):替换值带单引号（文档 cp 命令自 r14 起示范引号
-    #   形态——含空格安装路径须引号防 shlex 切碎；shlex 撇引号后路径仍是一个 token）
+    #   {fence dedent（隐含于 splitlines+strip）, CRLF→LF, `<SKILL_DIR>` 占位符纯替换}
+    #   r14(Bugbot "spaced installs"):文档 cp 命令带单引号（含空格安装路径须引号防
+    #   shlex 切碎；shlex 撇引号后路径仍是一个 token）
     # ——占位符字面含 <>，会被分词器切进重定向层使段长 ≠ 3（prefix:cp 假红），
     #   故替换是验收前提；断言占位符无残留（合法的 2>/dev/null 类重定向不算）。
     bad_xform = [c for c in cmds if "<SKILL_DIR" in c]
     check("G1a 抽取器变换后无 <SKILL_DIR> 占位符残留", not bad_xform,
           "; ".join(repr(c) for c in bad_xform))
+    # G1c:r15(Bugbot 4668735266)——变换后禁止嵌套空引号（`''`）：文档引号+替换值再包
+    # 一层即产出 `''路径''`，空格落在引号外=引号保护失效。此断言钉死双层引号回归。
+    bad_dq = [c for c in cmds if "''" in c]
+    check("G1c 变换后无嵌套空引号（防文档引号+替换值引号叠加）", not bad_dq,
+          "; ".join(repr(c) for c in bad_dq))
     # r13(GPT 外审九轮 P1):守卫来源身份=守卫所在插件包的真实技能目录——占位符
     # 替换值必须是真插件目录（本测试即 SKILL_DIR=仓库技能目录），不再喂假束：
     # 假束（含 SKILL.md）自 r13 起一律 deny（见 G22），喂假束会反向假红。
