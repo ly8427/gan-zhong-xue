@@ -411,6 +411,7 @@ def main():
     test_writer_states()
     test_append_only()
     test_capture_dedup()
+    test_capture_exception_silent_by_default()
     test_audit_no_raw_command()
     test_map_field_greppable()
     test_migration_no_rewrite()
