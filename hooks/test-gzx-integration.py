@@ -187,13 +187,15 @@ def main():
         # 文件再等 GO；父进程等齐全部 READY(30s 超时)才放行 GO。Popen 返回≠
         # worker 就绪,单 GO 文件仍可能串行;双阶段才保证争用确定性发生。
         # 超时 ⇒ 杀 worker(其 rc 非 0 ⇒ 用例自然红)。
+        # Bugbot 4661969381(82b3cc2): worker 等的是 GO 文件,不是 bar 目录——
+        # 目录 mkdtemp 时已存在,等它=空等,GO 无人检查,屏障形同虚设。
         bar_dir = tempfile.mkdtemp(prefix="gzx-e2e-bar-")
         go_path = os.path.join(bar_dir, "GO")
         bootstrap = (
             "import os, sys, time, runpy\n"
-            "bar, worker, data, ready = sys.argv[1:5]\n"
+            "go, worker, data, ready = sys.argv[1:5]\n"
             "open(ready, 'w').close()\n"
-            "while not os.path.exists(bar):\n"
+            "while not os.path.exists(go):\n"
             "    time.sleep(0.005)\n"
             "sys.argv = [worker, data]\n"
             "sys.stdin = open(data, 'r', newline='')\n"
@@ -209,7 +211,7 @@ def main():
             readies.append(ready)
             infiles.append(infile.name)
             pr = subprocess.Popen(
-                [sys.executable, "-c", bootstrap, bar_dir, worker_py,
+                [sys.executable, "-c", bootstrap, go_path, worker_py,
                  infile.name, ready],
                 stdin=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env)
             procs.append(pr)
