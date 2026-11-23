@@ -238,12 +238,12 @@ cat ~/.gan-zhong-xue/map.jsonl 2>/dev/null
 
 **块 2（仅当块 1 的 `ls` 无输出——首次部署写入器）**：
 ```bash
-cp <SKILL_DIR>/gzx-append.sh ~/.gan-zhong-xue/gzx-append.sh
-cp <SKILL_DIR>/gzx_lock_append.py ~/.gan-zhong-xue/gzx_lock_append.py
+cp '<SKILL_DIR>/gzx-append.sh' ~/.gan-zhong-xue/gzx-append.sh
+cp '<SKILL_DIR>/gzx_lock_append.py' ~/.gan-zhong-xue/gzx_lock_append.py
 chmod +x ~/.gan-zhong-xue/gzx-append.sh
 ~/.gan-zhong-xue/gzx-append.sh badtarget </dev/null
 ```
-`<SKILL_DIR>` 由模型替换为本 SKILL.md 所在目录（本文件就在那里面，模型必然知道）。守卫对「cp 写入器两件进数据目录 / mkdir / chmod 数据目录」放行（v1.1.1 收紧：cp 的源必须是 gzx-append.sh 或 gzx_lock_append.py、目标必须在数据目录内）。**末行 = 直执行自检（v1.1.1 M1，与正式保存同一调用形态、打真实安装位）**：应回 stderr `gzx-append: unknown target: badtarget` 且退出码 21、不写任何文件——报 Permission denied、或没有任何输出 = 部署失败，**向用户明说再用**（不静默降级）。
+`<SKILL_DIR>` 由模型替换为本 SKILL.md 所在目录（本文件就在那里面，模型必然知道），**保留单引号**——安装路径可能含空格，引号保证命令不被拆散。守卫对「cp 写入器两件进数据目录 / mkdir / chmod 数据目录」放行（r13 收紧：cp 的源必须是 gzx-append.sh 或 gzx_lock_append.py、目标必须是数据目录内的写入器两件之一、**源必须是本插件包内的官方文件**（守卫按自身安装位置精确核对，目录里造个 SKILL.md 冒充没用）；chmod 仅 `700` 与写入器 `+x`）。**末行 = 直执行自检（v1.1.1 M1，与正式保存同一调用形态、打真实安装位）**：应回 stderr `gzx-append: unknown target: badtarget` 且退出码 21、不写任何文件——报 Permission denied、或没有任何输出 = 部署失败，**向用户明说再用**（不静默降级）。
 - **提交捕获的兑现规则（v1.0.9 C'）**：台账行不删（append-only）；挖完的提交在下次开头口头确认"这条挖过了"即可，**用户的'不用挖了'同样只改口头、不动台账**（台账是 hook 的捕获记录，不是待办清单——待办语义在 pending）。
 - **回访率分母（D6）**：= 已展示给用户的候选数 + 最小样本量；candidates 行被读过且长出对应地图格才算一次回访。
 - **md 按需读、不全 cat**：`map.md` 是最胖的细节库，**别每次全读**（随地图膨胀会爆 token）。需要某一格细节（复验命中、或挖到它）时只读那一格，例如 `grep -F -A 8 -- '## <概念>' ~/.gan-zhong-xue/map.md`（`-F` 固定串——概念里的 `.`/`[` 不当正则；单引号防 `$(...)` 注入；`--` 防概念以 `-` 开头）。

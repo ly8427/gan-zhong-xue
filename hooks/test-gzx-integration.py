@@ -335,9 +335,11 @@ def main():
         for ln in blk.splitlines():
             ln = ln.strip()
             if ln and not ln.startswith("#"):
-                cmds.append(ln.replace("<SKILL_DIR>", _posix(SKILL_DIR)))
+                cmds.append(ln.replace("<SKILL_DIR>", "'" + _posix(SKILL_DIR) + "'"))
     # 抽取器变换清单（board #122 dsh #2675 §2，写死防误读）：
     #   {fence dedent（隐含于 splitlines+strip）, CRLF→LF, `<SKILL_DIR>` 占位符替换}
+    #   r14(Bugbot "spaced installs"):替换值带单引号（文档 cp 命令自 r14 起示范引号
+    #   形态——含空格安装路径须引号防 shlex 切碎；shlex 撇引号后路径仍是一个 token）
     # ——占位符字面含 <>，会被分词器切进重定向层使段长 ≠ 3（prefix:cp 假红），
     #   故替换是验收前提；断言占位符无残留（合法的 2>/dev/null 类重定向不算）。
     bad_xform = [c for c in cmds if "<SKILL_DIR" in c]
@@ -417,8 +419,8 @@ def main():
     # G15:dsh #2675 §5 请有 shell 方补的一格——<SKILL_DIR> 字面形状 deny、替换后 allow
     check("G15a <SKILL_DIR> 占位符字面 → deny（占位符不可直接执行）",
           not gdoc.classify("cp <SKILL_DIR>/gzx-append.sh ~/.gan-zhong-xue/gzx-append.sh").allow)
-    check("G15b 占位符替换成实路径 → allow（G1 已覆盖,此处单独钉）",
-          gdoc.classify("cp %s/gzx-append.sh ~/.gan-zhong-xue/gzx-append.sh" % _posix(SKILL_DIR)).allow)
+    check("G15b 占位符替换成实路径（引号形态）→ allow（G1 已覆盖,此处单独钉）",
+          gdoc.classify("cp '%s/gzx-append.sh' ~/.gan-zhong-xue/gzx-append.sh" % _posix(SKILL_DIR)).allow)
     check("G16 正文多 CR（E\\r\\r）+ 其后接 rm → deny（r7 全剥 CR 后唯一性破）",
           not gdoc.classify("~/.gan-zhong-xue/gzx-append.sh map <<'E'\nE\r\r\n"
                             "rm ~/.gan-zhong-xue/map.md\nE").allow)

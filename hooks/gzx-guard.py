@@ -455,12 +455,14 @@ def selftest():
         "bash ~/.gan-zhong-xue/gzx-append.sh map",           # 写入器：shell 包装
         # V1.1.0(P1-2):首次安装引导——部署写入器/建目录/收权限（.bak 别名余量 r12 收回，移 deny）
         # r13:源=守卫所在插件包技能目录（身份精确相等,不再按 cwd 相对解析）
-        "cp %s/gzx-append.sh ~/.gan-zhong-xue/gzx-append.sh" % _pkg_skill,
+        # r14(Bugbot "spaced installs"):源路径加单引号——shlex 撇引号后含空格路径仍是
+        # 一个 token，带空格安装目录不再被切碎（未引号+空格=多 token 恒 deny,语义本歧义）
+        "cp '%s/gzx-append.sh' ~/.gan-zhong-xue/gzx-append.sh" % _pkg_skill,
         "mkdir -p ~/.gan-zhong-xue",
         "chmod 700 ~/.gan-zhong-xue",
         # V1.1.1(board #122 M1/M2):SKILL.md 第 -1 步改版后的单句引导与自检
         "chmod +x ~/.gan-zhong-xue/gzx-append.sh",
-        "cp %s/gzx_lock_append.py ~/.gan-zhong-xue/gzx_lock_append.py" % _pkg_skill,
+        "cp '%s/gzx_lock_append.py' ~/.gan-zhong-xue/gzx_lock_append.py" % _pkg_skill,
         "ls ~/.gan-zhong-xue/gzx-append.sh 2>/dev/null",
         "cat ~/.gan-zhong-xue/pending.md 2>/dev/null",
         "cat ~/.gan-zhong-xue/candidates.jsonl 2>/dev/null",
