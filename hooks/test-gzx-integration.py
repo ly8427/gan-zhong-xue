@@ -18,6 +18,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -54,9 +55,39 @@ def run_capture(env, payload):
                           capture_output=True, timeout=30)
 
 
+def _rmtree(path):
+    """删目录树并返回「确实删干净了」。
+
+    v1.1.2（GPT 外审十轮 P3-1 根因修正）：Windows 上 git 把 .git/objects/* 设为只读
+    （mode 444），shutil.rmtree 删只读文件报 PermissionError——而 ignore_errors=True
+    把这个错吞掉，于是「清理代码跑了、目录还在」（实测系统临时目录积了 84 个 gzx-int-*）。
+    对症：出错时清只读位再重试；返回值让调用方能断言真的删掉，不再静默。"""
+    def _onerr(func, p, _exc):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except OSError:
+            pass
+    shutil.rmtree(path, onerror=_onerr)
+    return not os.path.exists(path)
+
+
 def main():
-    # ---- 场景工作区：真实 git 仓库 + 隔离数据目录 + 模拟插件技能目录 ----
+    # v1.1.2（GPT 外审十轮 P3-1）：全部临时物统一建在一个根目录下，退出时整体清理——
+    # 此前 worker 脚本目录（gzx_e1_*）、屏障目录与输入文件、场景根目录（gzx-int-*）
+    # 每次运行都遗留。try/finally 保证断言失败抛异常时也不遗留。
     work = tempfile.mkdtemp(prefix="gzx-int-")
+    try:
+        return _run(work)
+    finally:
+        cleaned = _rmtree(work)
+        if not cleaned:
+            # 清理失败要看得见：以前是 ignore_errors=True 静默吞掉
+            print("WARN 集成测试临时目录未能清干净: %s" % work)
+
+
+def _run(work):
+    # ---- 场景工作区：真实 git 仓库 + 隔离数据目录 + 模拟插件技能目录 ----
     gzx_dir = os.path.join(work, "data", ".gan-zhong-xue")   # 故意缺写入器（场景 A 前提）
     repo = os.path.join(work, "repo")
     skill_dir = os.path.join(work, "plugins", "gan-zhong-xue", "skills", "gan-zhong-xue")
@@ -160,6 +191,83 @@ def main():
     rows = [json.loads(l) for l in open(cand, encoding="utf-8") if l.strip()]
     check("D4 失败提交(无成功标记)不捕获", len(rows) == 1)
 
+    # D5（v1.1.2 GPT 外审十轮 P2-1）：命令链/绝对路径/env 前缀的提交也要捕获。
+    # 每条都是真提交（真改文件真 commit），捕获后断言 sha == 新 HEAD——端到端，不是只测识别函数。
+    def real_commit_and_capture(n, command):
+        with open(os.path.join(repo, "f%d.txt" % n), "w", encoding="utf-8") as f:
+            f.write("x%d\n" % n)
+        git("add", "f%d.txt" % n)
+        git("commit", "-m", "c%d" % n)
+        new_head = git("rev-parse", "HEAD").stdout.decode().strip()
+        new_short = git("rev-parse", "--short", "HEAD").stdout.decode().strip()
+        run_capture(capture_env(), {
+            "tool_name": "Bash", "cwd": repo,
+            "tool_input": {"command": command},
+            "tool_response": {"output": "[main %s] c%d" % (new_short, n)},
+        })
+        return new_head
+
+    forms = [
+        'cd %s && git commit -m "fix"' % _posix(repo),   # GPT 十轮 P2-1 正例 1
+        "/usr/bin/git commit -m fix",                     # GPT 十轮 P2-1 正例 2
+        "env GIT_AUTHOR_NAME=test git commit -m fix",     # GPT 十轮 P2-1 正例 3
+        "git -C %s commit -m x" % _posix(repo),           # 全局选项 -C（MSYS /c/ 形态）
+        "git -C '%s' commit -m x" % repo.replace("\\", "/"),   # 全局选项 -C（盘符+正斜杠，冒号接回）
+        "git --no-pager commit --amend --no-edit",        # 全局旗标 + 子命令选项
+        "git add -A && git commit -m gen && git push",    # 命令链中段
+    ]
+    d5_ok, d5_detail = True, ""
+    for n, command in enumerate(forms, start=1):
+        want = real_commit_and_capture(n, command)
+        with open(cand, encoding="utf-8") as f:
+            shas = [json.loads(l)["sha"] for l in f if l.strip()]
+        if want not in shas:
+            d5_ok, d5_detail = False, "form %r not captured (have %d rows)" % (command, len(shas))
+            break
+    check("D5 命令链/绝对路径/env 前缀/全局选项的提交均被捕获（%d 种形态）" % len(forms),
+          d5_ok, d5_detail)
+
+    # D6（同轮反例）：命令里出现 commit 字样但不是提交动作 → 不落账。
+    with open(cand, encoding="utf-8") as f:
+        before_neg = len([l for l in f if l.strip()])
+    non_commits = [
+        "echo git commit -m fix",
+        "git status",
+        "git log --oneline",
+        "git log --grep commit",
+        "git config commit.gpgsign true",
+        "cat notes.txt | grep commit",
+        "python x.py --msg 'git commit -m hi'",
+        "git tag -a v9 -m commit",
+        "docker exec box git commit -m x",       # 包装器后：cwd 不可信，不捕获（漏报方向）
+    ]
+    for command in non_commits:
+        # 输出故意带成功标记形状：识别层若误判，后道防线会因标记与 HEAD 不符而拦——
+        # 这里要证明的是识别层根本不放行（第一道门就关）。
+        run_capture(capture_env(), {
+            "tool_name": "Bash", "cwd": repo,
+            "tool_input": {"command": command},
+            "tool_response": {"output": "[main deadbee] whatever"},
+        })
+    with open(cand, encoding="utf-8") as f:
+        after_neg = len([l for l in f if l.strip()])
+    check("D6 含 commit 字样但非提交动作的命令不落账（%d 种形态）" % len(non_commits),
+          after_neg == before_neg, "before=%d after=%d" % (before_neg, after_neg))
+
+    # D7（同轮）：`git commit --help` 被识别层判为 commit 动作，但输出无成功标记 → 不落账
+    # （后道防线 P1-5 兜住；证明识别层不做 --help 特判也不会误捕获）。
+    with open(cand, encoding="utf-8") as f:
+        before_help = len([l for l in f if l.strip()])
+    run_capture(capture_env(), {
+        "tool_name": "Bash", "cwd": repo,
+        "tool_input": {"command": "git commit --help"},
+        "tool_response": {"output": "GIT-COMMIT(1)\n\nNAME\n       git-commit - Record changes"},
+    })
+    with open(cand, encoding="utf-8") as f:
+        after_help = len([l for l in f if l.strip()])
+    check("D7 git commit --help 不落账（成功标记防线）", after_help == before_help,
+          "before=%d after=%d" % (before_help, after_help))
+
     # 并发:双进程同 sha → 恰 1 行(P1-4 原子性)
     sys.path.insert(0, SKILL_DIR)
     import importlib.util as _iu
@@ -169,106 +277,146 @@ def main():
     spec2.loader.exec_module(core)
     # 并发（v1.1.2 重写——Bugbot PR#4 Medium：旧版 worker 用 python -c 且换行
     # 写成字面 \\n，两个进程直接 SyntaxError 全灭；D1 的旧行让断言空过，
-    # lock_append_commit_unique 的并发路径从未被测过。改为 worker 落临时
-    # 文件（真换行）+ 回收 rc 证明真跑了 + 争用断言真正咬合）。
-    worker_src = (
-        "import sys\n"
-        "sys.path.insert(0, r'" + SKILL_DIR + "')\n"
-        "import gzx_lock_append as c\n"
-        "rc, msg = c.lock_append_commit_unique(\n"
-        "    r'" + gzx_dir + "', sys.stdin.buffer.read())\n"
-        "sys.stderr.write(str(rc))\n"
-    )
-    worker_py = os.path.join(tempfile.mkdtemp(prefix="gzx_e1_"), "worker.py")
-    with open(worker_py, "w", encoding="utf-8") as f:
-        f.write(worker_src)
+    # lock_append_commit_unique 的并发路径从未被测过。改为 worker 真跑 + 回收 rc
+    # 证明真跑了 + 争用断言真正咬合）。
+    # worker 源码：三引号原文，换行是真换行（不是 "\\n" 字面量——那正是旧缺陷的成因）。
+    # 屏障设计（v1.1.2 GPT 外审十轮 P2-2）：READY 必须意味着「除了进锁，一切都做完了」——
+    #   导入模块 → 读入数据 → 解析参数 → 【写 READY】→ 等 GO → 调用锁函数。
+    # 旧版 READY 写在 bootstrap 一开始，GO 之后还要做模块加载/读文件，操作系统完全
+    # 可以让第一个 worker 把这些步骤连同整个写入跑完、第二个才被调度 ⇒ 测不到争用。
+    # 现在 GO 释放后，worker 距离锁入口只剩一次函数调用。
+    bar_root = os.path.join(work, "barrier")
+    os.makedirs(bar_root, exist_ok=True)
+    worker_src = '''
+import json
+import os
+import sys
+import time
+
+go_path, data_path, core_dir, gzx_dir, ready_path = sys.argv[1:6]
+sys.path.insert(0, core_dir)
+import gzx_lock_append as core
+
+with open(data_path, "rb") as f:
+    data = f.read()
+json.loads(data.decode("utf-8"))            # 参数在等 GO 之前就备好（解析失败在此暴露）
+
+open(ready_path, "w").close()               # READY = 只差进锁
+deadline = time.time() + 60
+while not os.path.exists(go_path):
+    if time.time() > deadline:
+        sys.stderr.write("timeout waiting GO")
+        sys.exit(3)
+    time.sleep(0.001)
+
+rc, msg = core.lock_append_commit_unique(gzx_dir, data)
+sys.stderr.write(str(rc))
+sys.exit(0 if rc == 0 else 4)
+'''
 
     def spawn_workers(row_objs):
-        # GPT 外审(PR#4 六/七轮): 双阶段屏障——worker 启动后先写自己的 READY
-        # 文件再等 GO；父进程等齐全部 READY(30s 超时)才放行 GO。Popen 返回≠
-        # worker 就绪,单 GO 文件仍可能串行;双阶段才保证争用确定性发生。
-        # 超时 ⇒ 杀 worker(其 rc 非 0 ⇒ 用例自然红)。
-        # Bugbot 4661969381(82b3cc2): worker 等的是 GO 文件,不是 bar 目录——
-        # 目录 mkdtemp 时已存在,等它=空等,GO 无人检查,屏障形同虚设。
-        bar_dir = tempfile.mkdtemp(prefix="gzx-e2e-bar-")
+        """并发启动 len(row_objs) 个 worker；全部 READY 后统一放 GO。
+        返回 [(returncode, stderr), ...]，顺序与 row_objs 对应。"""
+        bar_dir = tempfile.mkdtemp(prefix="run-", dir=bar_root)
         go_path = os.path.join(bar_dir, "GO")
-        bootstrap = (
-            "import os, sys, time, runpy\n"
-            "go, worker, data, ready = sys.argv[1:5]\n"
-            "open(ready, 'w').close()\n"
-            "while not os.path.exists(go):\n"
-            "    time.sleep(0.005)\n"
-            "sys.argv = [worker, data]\n"
-            "sys.stdin = open(data, 'r', newline='')\n"
-            "runpy.run_path(worker, run_name='__main__')\n"
-        )
         procs, readies, infiles = [], [], []
         for i, row_obj in enumerate(row_objs):
-            infile = tempfile.NamedTemporaryFile(
-                "wb", prefix="gzx-e2e-", suffix=".json", delete=False)
-            infile.write((json.dumps(row_obj, ensure_ascii=False) + "\n").encode("utf-8"))
-            infile.close()
+            infile = os.path.join(bar_dir, "in-%d.json" % i)
+            with open(infile, "wb") as f:
+                f.write((json.dumps(row_obj, ensure_ascii=False) + "\n").encode("utf-8"))
             ready = os.path.join(bar_dir, "ready-%d" % i)
+            procs.append(subprocess.Popen(
+                [sys.executable, "-c", worker_src, go_path, infile,
+                 SKILL_DIR, gzx_dir, ready],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE, env=env))
             readies.append(ready)
-            infiles.append(infile.name)
-            pr = subprocess.Popen(
-                [sys.executable, "-c", bootstrap, go_path, worker_py,
-                 infile.name, ready],
-                stdin=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env)
-            procs.append(pr)
-        # 等齐全部 READY(30s);超时 ⇒ 杀 worker(rc 非 0 ⇒ 用例红,不留假绿)
-        deadline = time.time() + 30
+            infiles.append(infile)
+        # 等齐全部 READY(60s)；超时 ⇒ 杀 worker(其 rc 非 0 ⇒ 用例红,不留假绿)
+        deadline = time.time() + 60
         while time.time() < deadline:
             if all(os.path.exists(r) for r in readies):
                 break
-            time.sleep(0.02)
+            time.sleep(0.002)
         if not all(os.path.exists(r) for r in readies):
             for pr in procs:
                 pr.kill()
         with open(go_path, "w") as _g:
             _g.write("go")
         outs = []
-        for pr, infile_name in zip(procs, infiles):
-            _, err = pr.communicate(timeout=30)
+        for pr in procs:
+            _, err = pr.communicate(timeout=60)
             outs.append((pr.returncode, err.decode("utf-8", "replace")))
-        for infile_name in infiles:
-            try:
-                os.unlink(infile_name)
-            except OSError:
-                pass
-        try:
-            shutil.rmtree(bar_dir, ignore_errors=True)
-        except OSError:
-            pass
+        _rmtree(bar_dir)          # 每轮即清；根目录在 main 的 finally 兜底
         return outs
 
     def cand_rows():
-        return [json.loads(l) for l in open(cand, encoding="utf-8") if l.strip()]
+        if not os.path.exists(cand):
+            return []
+        with open(cand, encoding="utf-8") as f:
+            return [json.loads(l) for l in f if l.strip()]
 
-    # E1 并发争用（不同 sha）：两 worker 同时在跑 → 两行都在
-    rcs = spawn_workers([{"sha": head + "-e1a", "add": 1, "del": 0,
-                          "event": "commit", "ts": "2026-11-11T00:00:00Z"},
-                         {"sha": head + "-e1b", "add": 2, "del": 0,
-                          "event": "commit", "ts": "2026-11-11T00:00:01Z"}])
-    check("E1a 两 worker 真跑了(rc=0)", all(rc == 0 for rc, _ in rcs),
-          "rcs=%r" % (rcs,))
-    got = sorted(r_["sha"] for r_ in cand_rows()
-                 if str(r_["sha"]).endswith(("-e1a", "-e1b")))
-    check("E1b 并发两行都在(锁串行化)", len(got) == 2, "got %r" % (got,))
-    rows = cand_rows()
-    seqs = sorted(r_.get("seq") for r_ in rows)
-    check("E2 seq 全文件唯一且连续(锁内现算)",
-          seqs == list(range(1, len(rows) + 1)), "seqs=%r" % (seqs,))
+    def seq_is_contiguous(rows):
+        seqs = sorted(r_.get("seq") for r_ in rows)
+        return seqs == list(range(1, len(rows) + 1)), seqs
 
-    # E3 同 sha 并发竞态：两 worker 同 sha → 零新增（去重原子性在争用下成立）
-    before = len(cand_rows())
-    rcs = spawn_workers([{"sha": head, "add": 1, "del": 0,
-                          "event": "commit", "ts": "2026-11-11T00:00:00Z"}
-                         for _ in range(2)])
-    check("E3a 两 worker 真跑了(rc=0)", all(rc == 0 for rc, _ in rcs),
-          "rcs=%r" % (rcs,))
-    check("E3b 同 sha 并发零新增(去重原子)", len(cand_rows()) == before,
-          "新增 %d" % (len(cand_rows()) - before))
+    # ---- E：并发不变量（P1-4 原子性）。多轮压力（GPT 十轮 P2-2）：
+    #   单轮里操作系统完全可能把 worker 串行调度；多轮 + 多 worker 让「每轮都
+    #   恰好串行、且每次都掩盖住锁缺陷」的概率随轮数指数下降。
+    #   如实边界：测试无法从外部观测「两进程同时持锁」，那由锁实现本身保证；
+    #   这里的证明强度 = 高强度争用下三条不变量（不丢行 / seq 唯一连续 / 同 sha 不重复）
+    #   逐轮成立。
+    #   旧版 E3 的 sha 用的是 head——它在 D1 阶段已被捕获过，所以旧断言「零新增」
+    #   测的其实是「已存在的 sha 不重写」，不是并发去重；这里每轮用全新 sha，
+    #   断言「恰 +1」才是真正的并发去重。
+    STRESS_ROUNDS = 20
+    WORKERS = 8
+    e1_ok, e1_detail = True, ""
+    for rnd in range(STRESS_ROUNDS):
+        before = len(cand_rows())
+        tag = "r%d-" % rnd
+        rows_in = [{"sha": "%s%s-%d" % (head[:12], tag, k), "add": k + 1, "del": 0,
+                    "event": "commit", "ts": "2026-11-11T00:00:00Z"} for k in range(WORKERS)]
+        rcs = spawn_workers(rows_in)
+        if not all(rc == 0 for rc, _ in rcs):
+            e1_ok, e1_detail = False, "round %d rcs=%r" % (rnd, rcs)
+            break
+        got = [r_["sha"] for r_ in cand_rows() if str(r_["sha"]).startswith(head[:12] + tag)]
+        if sorted(got) != sorted(r_["sha"] for r_ in rows_in):
+            e1_ok, e1_detail = False, "round %d lost/dup rows: got %d want %d" % (
+                rnd, len(got), len(rows_in))
+            break
+        ok_seq, seqs = seq_is_contiguous(cand_rows())
+        if not ok_seq or len(seqs) != before + WORKERS:
+            e1_ok, e1_detail = False, "round %d seq broken: %r" % (rnd, seqs[-12:])
+            break
+    check("E1 %d worker × %d 轮：不同 sha 并发不丢行不重复（锁串行化）" % (WORKERS, STRESS_ROUNDS),
+          e1_ok, e1_detail)
+
+    ok_seq, seqs = seq_is_contiguous(cand_rows())
+    check("E2 E1 压力后 seq 全文件唯一且连续(锁内现算)", ok_seq,
+          "n=%d seqs=%r" % (len(seqs), seqs[-12:]))
+
+    e3_ok, e3_detail = True, ""
+    for rnd in range(STRESS_ROUNDS):
+        before = len(cand_rows())
+        same_sha = "%s-e3-%d" % (head[:12], rnd)
+        rcs = spawn_workers([{"sha": same_sha, "add": 1, "del": 0,
+                              "event": "commit", "ts": "2026-11-11T00:00:00Z"}
+                             for _ in range(WORKERS)])
+        if not all(rc == 0 for rc, _ in rcs):
+            e3_ok, e3_detail = False, "round %d rcs=%r" % (rnd, rcs)
+            break
+        after = len(cand_rows())
+        if after != before + 1:
+            e3_ok, e3_detail = False, "round %d: before=%d after=%d (want +1)" % (
+                rnd, before, after)
+            break
+    check("E3 %d worker 同(新)sha × %d 轮：每轮恰落 1 行（去重原子）" % (WORKERS, STRESS_ROUNDS),
+          e3_ok, e3_detail)
+
+    ok_seq, seqs = seq_is_contiguous(cand_rows())
+    check("E4 全部压力后 seq 仍唯一且连续", ok_seq, "n=%d" % len(seqs))
 
     # ---- F: pending 走写入器(P1-3) ----
     r = run_capture(env, {"tool_name": "Read"})  # 触发一次无关调用,确认 pending 仍空
@@ -447,18 +595,19 @@ def main():
     # G22:r13(GPT 外审九轮 P1)——SKILL.md 形态标记可伪造：真造一个带 SKILL.md 的假
     # 插件束（含同名写入器），来源身份按路径精确相等判定 ⇒ 必 deny。这正是 r12
     # 形态检查会放行、r13 收紧后的关键负例（GPT 点名形状）。
-    fake_plugin = "/tmp/gzx-fake-plugin"
+    # v1.1.2(GPT 外审十轮 P3-1 同族清理):假束建在统一根目录下，不再写死 /tmp。
+    fake_plugin = os.path.join(work, "fake-plugin")
     os.makedirs(fake_plugin, exist_ok=True)
     for f in ("SKILL.md", "gzx-append.sh", "gzx_lock_append.py"):
         shutil.copy(os.path.join(SKILL_DIR, f), os.path.join(fake_plugin, f))
     check("G22 假插件束（SKILL.md+同名写入器）覆盖写入器 → deny（来源身份层）",
-          not gdoc.classify("cp /tmp/gzx-fake-plugin/gzx-append.sh ~/.gan-zhong-xue/gzx-append.sh").allow)
-    shutil.rmtree(fake_plugin, ignore_errors=True)
+          not gdoc.classify("cp %s/gzx-append.sh ~/.gan-zhong-xue/gzx-append.sh"
+                            % _posix(fake_plugin)).allow)
     # G23:r13(GPT 外审九轮 P2)——首位 7 不再放行 750/755/777，恰 700 才豁免
     check("G23 chmod 777 数据目录 → deny（本地数据隐私,仅 700）",
           not gdoc.classify("chmod 777 ~/.gan-zhong-xue").allow)
 
-    print("\\n%s：%d 项失败" % ("FAILED" if FAILS else "ALL PASS", len(FAILS)))
+    print("\n%s：%d 项失败" % ("FAILED" if FAILS else "ALL PASS", len(FAILS)))
     return 1 if FAILS else 0
 
 

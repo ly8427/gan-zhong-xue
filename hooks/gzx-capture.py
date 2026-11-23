@@ -26,6 +26,7 @@ v1.1.0（GPT PR #4 审查收口）：
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -54,6 +55,142 @@ def _extract_committed_sha(text):
     """从 commit 命令输出提取成功标记里的 sha；无标记 = 提交未成功 → None。"""
     m = _COMMIT_OK_RE.search(text or "")
     return m.group(1) if m else None
+
+
+# 环境前缀赋值：NAME=value（出现在命令首部时是设置环境变量，不是要执行的命令）
+_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# 结构分隔符：命令链/管道/后台/换行/子 shell——它们切出「一条简单命令」的边界
+_CMD_SEPARATORS = {"&&", "||", "|", "|&", ";", ";;", "&", "\n", "(", ")", "{", "}"}
+# shell 保留字：它们自己不是要执行的程序，出现即开启一个新的命令段
+#   （`if true; then git commit; fi`——then 之后的 git 才是命令首词）
+_SHELL_RESERVED = {"if", "then", "else", "elif", "fi", "for", "while", "until", "do",
+                   "done", "case", "esac", "in", "function", "time", "!", "{", "}",
+                   "[[", "]]", "coproc", "select"}
+# 重定向算子（下一词是目标文件——与本层无关，算子本身丢弃，目标词留着无害）
+_REDIRECT_OPS = {">", ">>", "<", ">|", "<&", ">&", "&>", "&>>", "<>"}
+# 全部边界词：分隔符 ∪ 保留字 ∪ 重定向算子——「冒号接回」不得跨越它们
+_ALL_BOUNDARIES = _CMD_SEPARATORS | _SHELL_RESERVED | _REDIRECT_OPS
+
+
+def _lex(cmd):
+    """shell 切词（posix：引号内不外泄成结构符），并把 shlex 切开的冒号接回去。
+
+    shlex 一旦启用 punctuation_chars，**任何冒号都被切成独立词元**（Python 文档
+    明载：为支持 Windows 路径而如此设计）——实测 `git -C C:/r commit` 被切成
+    ['git','-C','C',':','/r','commit']，`-C` 把 'C' 当成了路径值。
+    后处理：一个独立的 `:` 词元，若它**不是段首**（前一词存在且不是边界符）且
+    **后一词存在且不是边界符**，视为同一个词被切碎 ⇒ 前后接回。
+    段首的 `:`（shell 的 no-op 内建命令，如 `: && git commit`）不接回。
+    不可解析（引号未闭合等）→ 返回 None（漏报优于误报，与 P1-5 同向）。"""
+    try:
+        lex = shlex.shlex(cmd, posix=True, punctuation_chars="();<>|&\n")
+        lex.whitespace_split = False
+        lex.whitespace = " \t\r"
+        lex.commenters = ""
+        raw = list(lex)
+    except ValueError:
+        return None
+    merged = []
+    i = 0
+    n = len(raw)
+    while i < n:
+        tok = raw[i]
+        if (tok == ":" and merged and merged[-1] not in _ALL_BOUNDARIES
+                and i + 1 < n and raw[i + 1] not in _ALL_BOUNDARIES):
+            merged[-1] = merged[-1] + ":" + raw[i + 1]
+            i += 2
+            continue
+        merged.append(tok)
+        i += 1
+    return merged
+
+
+def _iter_simple_commands(cmd):
+    """把一条 shell 命令串切成「简单命令」的词元列表（生成器）。
+
+    v1.1.2（GPT 外审十轮 P2-1）：捕获判定不能只看整串的开头——`cd X && git commit`、
+    `/usr/bin/git commit`、`env A=b git commit` 都是真实提交却会被旧判定漏掉。
+    用 _lex 切词，按结构分隔符与 shell 保留字切段；不可解析 → 不产出任何命令。
+
+    已知不识别的形态（如实登记，漏报方向）：`sudo git commit`、`docker exec … git commit`
+    ——包装器后面的命令，cwd 与输出归属不可信；`xargs`/`find -exec` 间接提交。
+    识别为「是 commit 动作」但不会产生提交的形态（如 `git commit --help`）不在本层
+    排除：是否真有提交由后道防线把关（输出须有成功标记且与 HEAD 复核一致，P1-5）。"""
+    tokens = _lex(cmd or "")
+    if tokens is None:
+        return
+    seg = []
+    for tok in tokens:
+        if tok in _REDIRECT_OPS:
+            continue                           # 重定向符本身：跳过（目标词留在段内无害）
+        if tok in _CMD_SEPARATORS or tok in _SHELL_RESERVED:
+            if seg:
+                yield seg
+            seg = []
+            continue
+        seg.append(tok)
+    if seg:
+        yield seg
+
+
+# git 全局选项（权威=`git --help` 用法行；写在子命令 <command> 之前）。
+#   分开写、下一个词是值：-C <path>、-c <name>=<value>
+#   分开写或内联值：      --exec-path[=<path>]、--git-dir=<path>、--work-tree=<path>、
+#                        --namespace=<name>、--config-env=<name>=<envvar>
+#   无值旗标：            -v --version -h --help -p --paginate -P --no-pager
+#                        --no-replace-objects --no-lazy-fetch --no-optional-locks
+#                        --no-advice --bare
+_GIT_GLOBAL_WITH_ARG = {"-C", "-c"}
+_GIT_GLOBAL_OPTIONAL_VAL = {"--exec-path", "--git-dir", "--work-tree", "--namespace",
+                            "--config-env"}
+_GIT_GLOBAL_FLAGS = {"-v", "--version", "-h", "--help", "-p", "--paginate", "-P",
+                     "--no-pager", "--no-replace-objects", "--no-lazy-fetch",
+                     "--no-optional-locks", "--no-advice", "--bare"}
+
+
+def _skip_git_globals(seg, i):
+    """从 seg[i] 起跳过 git 的全局选项，返回子命令词的下标（到头则返回 len）。
+
+    判据全部对齐 `git --help` 用法行（v1.1.2 GPT 外审十轮 P2-1）：只认清单内的
+    全局选项，清单外的词一律视为子命令——不做「像旗标就跳过」的模糊判断。"""
+    n = len(seg)
+    while i < n:
+        w = seg[i]
+        if w in _GIT_GLOBAL_WITH_ARG:
+            i += 2                              # 短选项，值是下一个词
+        elif w.split("=", 1)[0] in _GIT_GLOBAL_OPTIONAL_VAL:
+            # 值可内联也可分开：内联（词里带 '='）则本词自足；分开写则值是下一个词
+            i += 2 if "=" not in w else 1
+        elif w in _GIT_GLOBAL_FLAGS:
+            i += 1
+        else:
+            break                               # 不在清单内 ⇒ 这就是子命令
+    return i
+
+
+def _is_git_commit_segment(seg):
+    """一个简单命令段是否为 `git commit`（允许 env 赋值前缀、env 命令包装、git 全局选项）。"""
+    i = 0
+    # 跳过前置环境赋值：FOO=bar git commit …
+    while i < len(seg) and _ENV_ASSIGN_RE.match(seg[i]):
+        i += 1
+    # env 包装：env [VAR=x …] git commit …
+    if i < len(seg) and seg[i].rsplit("/", 1)[-1] == "env":
+        i += 1
+        while i < len(seg) and (_ENV_ASSIGN_RE.match(seg[i]) or seg[i].startswith("-")):
+            i += 1
+    if i >= len(seg):
+        return False
+    git_prog = seg[i].rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    if git_prog != "git":
+        return False
+    i = _skip_git_globals(seg, i + 1)
+    return i < len(seg) and seg[i] == "commit"
+
+
+def is_commit_command(cmd):
+    """命令串里是否**执行**了 git commit（v1.1.2 GPT 外审十轮 P2-1）。"""
+    return any(_is_git_commit_segment(seg) for seg in _iter_simple_commands(cmd or ""))
 
 
 def _already_captured(sha):
@@ -93,8 +230,11 @@ def main():
         ti = event.get("tool_input", {}) or {}
         cmd = (ti.get("command") or "").strip()
 
-        # 只捕获 git commit（其他 Bash 调用无关）
-        if not cmd.startswith("git") or "commit" not in cmd.split():
+        # 只捕获真正执行了 git commit 的命令（其他 Bash 调用无关）。
+        # v1.1.2（GPT 外审十轮 P2-1）：按简单命令段识别——支持 `cd X && git commit`、
+        # `/usr/bin/git commit`、`env A=b git commit`；引号里的 commit、非 git 命令的
+        # commit 参数不算（见 is_commit_command）。
+        if not is_commit_command(cmd):
             _dbg("skip: not git commit")
             return
         resp_text = json.dumps(event.get("tool_response", {}), ensure_ascii=False)

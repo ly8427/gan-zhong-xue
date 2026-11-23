@@ -59,6 +59,21 @@ BASH_EXE = _find_git_bash()
 FAILS = []
 
 
+def _rmtree(path):
+    """删目录树并返回「确实删干净了」（v1.1.2 GPT 外审十轮 P3-1 根因修正）。
+    Windows 上 git 把 .git/objects/* 设为只读，rmtree 报 PermissionError，
+    ignore_errors=True 会吞掉它 ⇒ 清理代码跑了、目录还在。出错时清只读位重试。"""
+    def _onerr(func, p, _exc):
+        try:
+            import stat as _st
+            os.chmod(p, _st.S_IWRITE)
+            func(p)
+        except OSError:
+            pass
+    shutil.rmtree(path, onerror=_onerr)
+    return not os.path.exists(path)
+
+
 def check(name, ok, detail=""):
     print(("PASS " if ok else "FAIL ") + name + ((" — " + detail) if detail and not ok else ""))
     if not ok:
@@ -102,14 +117,18 @@ def test_core_states():
         r = run_core(d2, "map", "y")
         check("A5 目标被目录占用 → 23 写失败", r.returncode == 23,
               "rc=%d stderr=%s" % (r.returncode, r.stderr.decode(errors="replace")[:120]))
-        shutil.rmtree(d2, ignore_errors=True)
+        _rmtree(d2)
     finally:
-        shutil.rmtree(d, ignore_errors=True)
+        _rmtree(d)
 
 
 def test_writer_states():
     if BASH_EXE is None:
-        print("SKIP bash 面四态（本机无可用的非 WSL bash）——python 核心已覆盖不变量")
+        # dsh #2992 §一 实证：本函数共 5 条 check（A6/A7/A8/A9/A9b），旧文案写「四态」，
+        # 读文案会算成跳过 4 条、对不上分母。按实际条数写。
+        # 跳过就是跳过：不伪造 PASS（恒真灯会把「没跑」伪装成「通过」）。
+        print("SKIP bash 面写入器 5 条（A6/A7/A8/A9/A9b）——本机无可用的非 WSL bash；"
+              "python 核心已覆盖不变量")
         return
     d = tempfile.mkdtemp(prefix="gzx-test-")
     minimal = None
@@ -135,9 +154,9 @@ def test_writer_states():
         with open(os.path.join(d, "map.md"), "rb") as f:
             check("A9b 拒绝写时目标未被触碰", b"x" not in f.read())
     finally:
-        shutil.rmtree(d, ignore_errors=True)
+        _rmtree(d)
         if minimal:
-            shutil.rmtree(minimal, ignore_errors=True)
+            _rmtree(minimal)
 
 
 def test_append_only():
@@ -194,17 +213,39 @@ def test_append_only():
         check("B4 无交错（每行整词）",
               all(l.startswith("line-") and l.count("-") == 2 for l in lines))
     finally:
-        shutil.rmtree(d, ignore_errors=True)
+        _rmtree(d)
 
 
 def test_capture_dedup():
+    """C：捕获去重键 (sha,event)（D5）。
+
+    v1.1.2（GPT 外审十轮，承接 dsh #2992 / opencode #2994 双向实证）：旧版用假标记
+    `[main abc123]`——它过不了 P1-5 的「标记 sha 须等于 rev-parse HEAD」复核，
+    所以 candidates.jsonl 在**任何机器上**都不会被创建，C2（断言 ≤1 行，0 行也绿）
+    恒过、C3/C4 恒不执行：两条断言从未被证明过。改为在临时目录里建**真仓库 + 真提交**，
+    标记用真 HEAD 的短 sha ⇒ 捕获必然落账，C2 收紧为「恰 1 行」，C3/C4 真跑到。"""
     d = tempfile.mkdtemp(prefix="gzx-cap-")
+    repo = tempfile.mkdtemp(prefix="gzx-caprepo-")
     try:
+        def git(*args):
+            return subprocess.run(["git", "-C", repo] + list(args),
+                                  capture_output=True, timeout=30)
+        git("init", "-q")
+        git("config", "user.email", "t@example.invalid")
+        git("config", "user.name", "t")
+        with open(os.path.join(repo, "a.txt"), "w", encoding="utf-8") as f:
+            f.write("a\n")
+        git("add", "a.txt")
+        git("commit", "-q", "-m", "c1")
+        head = git("rev-parse", "HEAD").stdout.decode().strip()
+        short = git("rev-parse", "--short", "HEAD").stdout.decode().strip()
+        check("C0 夹具：临时真仓库有 HEAD（否则下列断言无意义）", len(head) == 40, head)
+
         ev = json.dumps({
             "tool_name": "Bash",
-            "tool_input": {"command": "git commit -m test"},
-            "cwd": os.getcwd(),
-            "tool_response": {"output": "[main abc123] test"},
+            "tool_input": {"command": "git commit -m c1"},
+            "cwd": repo,
+            "tool_response": {"output": "[main %s] c1" % short},   # 真短 sha
         })
         env = dict(os.environ, GZX_DIR=d)
         r1 = subprocess.run([sys.executable, CAPTURE], env=env, input=ev.encode(),
@@ -217,16 +258,115 @@ def test_capture_dedup():
             with open(cand, encoding="utf-8") as f:
                 rows = [json.loads(l) for l in f if l.strip()]
         check("C1 捕获退出 0（旁路不阻塞）", r1.returncode == 0 and r2.returncode == 0)
-        # 本仓库是 git 仓库且 HEAD 存在 → 去重生效恰 1 行；否则捕获静默跳过（0 行也合规）
-        check("C2 去重 (sha,event) ≤1 行", len(rows) <= 1, "got %d" % len(rows))
-        if rows:
+        check("C1b 捕获进程 stderr 为空（默认静默）",
+              r1.stderr == b"" and r2.stderr == b"", repr(r1.stderr[:120]))
+        # 真提交 ⇒ 必须恰好 1 行（旧断言 ≤1 让「0 行=根本没捕获」也过——假绿）
+        check("C2 去重 (sha,event) 恰 1 行（同 sha 两次触发）", len(rows) == 1,
+              "got %d rows" % len(rows))
+        if len(rows) == 1:
             row = rows[0]
+            check("C2b 行的 sha == HEAD", row.get("sha") == head,
+                  "%r vs %r" % (row.get("sha"), head))
             check("C3 行含 seq/ts/event 字段", all(k in row for k in ("seq", "ts", "event")))
+            check("C3b seq == 1（首行序号）", row.get("seq") == 1, repr(row.get("seq")))
             check("C4 行无路径无仓名（D1）",
                   "gan-zhong-xue" not in json.dumps(row)
-                  and "ZCodeProject" not in json.dumps(row))
+                  and "ZCodeProject" not in json.dumps(row)
+                  and "gzx-caprepo" not in json.dumps(row)
+                  and "a.txt" not in json.dumps(row))
+        else:
+            check("C3 行含 seq/ts/event 字段", False, "未执行：rows=%d" % len(rows))
+            check("C4 行无路径无仓名（D1）", False, "未执行：rows=%d" % len(rows))
     finally:
-        shutil.rmtree(d, ignore_errors=True)
+        left = [p for p in (d, repo) if not _rmtree(p)]
+        check("C9 测试自身的临时目录已清干净（含只读 .git/objects）", not left, repr(left))
+
+
+def _load_capture_module():
+    import importlib.util as _iu
+    spec = _iu.spec_from_file_location("gzx_capture_for_test", CAPTURE)
+    mod = _iu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_commit_command_recognition():
+    """C5-C7（v1.1.2 GPT 外审十轮 P2-1）：提交命令识别——按简单命令段，不是看整串开头。
+    正反例在此固化（不是只在开发探针里跑过）。"""
+    cap = _load_capture_module()
+    is_commit = cap.is_commit_command
+    # 应识别为提交动作
+    yes = [
+        "git commit -m fix",
+        "git commit --amend --no-edit",
+        'cd /workspace/project && git commit -m "fix"',     # GPT 十轮 P2-1 正例 1
+        "/usr/bin/git commit -m fix",                       # GPT 十轮 P2-1 正例 2
+        "env GIT_AUTHOR_NAME=test git commit -m fix",       # GPT 十轮 P2-1 正例 3
+        "FOO=bar git commit -m x",
+        "env -i FOO=bar /usr/bin/git commit",
+        "git add -A && git commit -m a && git push",
+        "git -C /repo commit -m x",
+        "git -C C:/repo commit -m x",                       # 盘符+正斜杠（冒号被 shlex 切开）
+        "git -c user.name=x commit -m y",
+        "git --git-dir=/r/.git commit -m x",
+        "git --git-dir /r/.git --work-tree=/r commit -m x",
+        "git --no-pager commit -m x",
+        "(git commit -m x)",
+        "{ git commit -m x; }",
+        "git commit -m 'a && b are inside quotes'",         # 引号内的 && 不是分隔符
+        "echo hi | git commit -F -",
+        "time git commit -m x",
+        "if true; then git commit -m x; fi",
+        "PATH=/usr/bin:/bin git commit -m x",
+        ": && git commit -m x",                             # 段首 no-op 内建命令
+    ]
+    # 不应识别（命令里出现 commit 字样，但不是在执行 git commit）
+    no = [
+        "git status",
+        "git log --oneline",
+        "echo git commit",
+        "echo 'git commit -m fix'",
+        "cat notes.txt | grep commit",
+        "git commit-tree HEAD -m x -p HEAD",
+        "git log --grep commit",
+        "git push",
+        "npm run commit",
+        "docker exec box git commit -m x",        # 包装器后：cwd/输出归属不可信 ⇒ 不捕获
+        "python x.py --msg 'git commit -m hi'",
+        "git tag -a commit -m x",
+        "git branch commit",
+        "git checkout commit",
+        "git config commit.gpgsign true",
+        "git merge --no-ff --no-commit",
+        "git help commit",
+        "git add commit",                        # add 一个名叫 commit 的路径
+        "git checkout -b commit",
+        "git push origin commit",
+        "git -C C:/repo status",                 # 全局选项后的子命令不是 commit
+        "gitk commit",
+        "mygit commit -m x",
+        "git-commit -m x",
+        "GIT_CMD=C:/x/git commit",               # 命令是名为 commit 的程序
+        "C:/tools/gitk commit",
+        "sudo git commit -m x",                  # sudo 后的命令：不识别（漏报方向，如实登记）
+        "gh commit",
+        "",
+        "   ",
+        "git",
+    ]
+    miss = [c for c in yes if not is_commit(c)]
+    false_pos = [c for c in no if is_commit(c)]
+    check("C5 提交命令正例全部识别（%d 条）" % len(yes), not miss, repr(miss))
+    check("C6 含 commit 字样的非提交命令全部不识别（%d 条）" % len(no), not false_pos,
+          repr(false_pos))
+    # 不可解析（引号未闭合）：一律不识别——漏报优于误报
+    check("C7 引号未闭合的命令不识别",
+          not is_commit("git commit -m 'unterminated")
+          and not is_commit("echo 'x && git commit -m y"))
+    # 识别层边界如实钉住：`git commit --help` 是 commit 动作，识别层判 True；
+    # 「不落账」由成功标记防线保证——端到端见集成套件 D7，这里只钉识别层的契约。
+    check("C8 git commit --help 识别层判 True（落账与否由成功标记防线把关，见集成 D7）",
+          is_commit("git commit --help") is True)
 
 
 def test_audit_no_raw_command():
@@ -253,7 +393,7 @@ def test_audit_no_raw_command():
         check("D4 审计无命令原文（D1）", "SECRET-VALUE-XYZ" not in content
               and "grep -i" not in content and "cat " not in content)
     finally:
-        shutil.rmtree(d, ignore_errors=True)
+        _rmtree(d)
 
 
 def test_version_face():
@@ -342,14 +482,10 @@ def test_capture_exception_silent_by_default():
     try:
         _capture_neg_body(d)
     finally:
-        shutil.rmtree(d, ignore_errors=True)
+        _rmtree(d)
 
 
 def _capture_neg_body(d):
-    ev = json.dumps({"tool_name": "Bash",
-                     "tool_input": {"command": "git status"},
-                     "cwd": os.getcwd(),
-                     "tool_response": {"output": "x"}}).encode()
     # 默认(无 RG_CAPTURE_DEBUG): 喂非法载荷迫使异常路径,stdout/stderr 应全空
     r1 = subprocess.run([sys.executable, CAPTURE], env=dict(os.environ, GZX_DIR=d),
                         input=b"not-json-at-all", capture_output=True, timeout=30)
@@ -398,7 +534,7 @@ def test_map_field_greppable():
         r = run_core(d, "jsonl", payload2 + "\n")
         check("E3 弃权串条目正常写入（D1 合法值）", r.returncode == 0)
     finally:
-        shutil.rmtree(d, ignore_errors=True)
+        _rmtree(d)
 
 
 def test_migration_no_rewrite():
@@ -418,6 +554,7 @@ def main():
     test_writer_states()
     test_append_only()
     test_capture_dedup()
+    test_commit_command_recognition()
     test_capture_exception_silent_by_default()
     test_audit_no_raw_command()
     test_map_field_greppable()
