@@ -63,8 +63,9 @@ def main():
     os.makedirs(os.path.join(gzx_dir, "data"), exist_ok=True)
     os.makedirs(repo, exist_ok=True)
     os.makedirs(skill_dir, exist_ok=True)
-    # 技能目录放一份写入器（模拟插件分发件）
-    for f in ("gzx-append.sh", "gzx_lock_append.py"):
+    # 技能目录放一份写入器（模拟插件分发件；SKILL.md 自 r12 起是 B1 来源合法性判据——
+    # 守卫要求 cp 源所在目录含 SKILL.md（插件束形态），夹具必须长成真插件束）
+    for f in ("SKILL.md", "gzx-append.sh", "gzx_lock_append.py"):
         shutil.copy(os.path.join(SKILL_DIR, f), os.path.join(skill_dir, f))
 
     # ---- A: 首次安装引导（P1-1）----
@@ -342,6 +343,12 @@ def main():
     bad_xform = [c for c in cmds if "<SKILL_DIR" in c]
     check("G1a 抽取器变换后无 <SKILL_DIR> 占位符残留", not bad_xform,
           "; ".join(repr(c) for c in bad_xform))
+    # r12(GPT 外审八轮 P1):守卫来源合法性判据=cp 源目录含 SKILL.md——占位符替换后的
+    # 假插件目录必须长成真插件束，否则块 2 的 cp 命令会因来源检查假红。
+    fake_skill = "/tmp/gzx-fake-skill-dir"
+    os.makedirs(fake_skill, exist_ok=True)
+    for f in ("SKILL.md", "gzx-append.sh", "gzx_lock_append.py"):
+        shutil.copy(os.path.join(SKILL_DIR, f), os.path.join(fake_skill, f))
     bad = [(c, gdoc.classify(c)) for c in cmds if not gdoc.classify(c).allow]
     check("G1 第 -1 步文档字节逐条 classify 全 allow", not bad,
           "; ".join("%r -> %s" % (c, d.rule) for c, d in bad))
@@ -418,6 +425,18 @@ def main():
     check("G16 正文多 CR（E\\r\\r）+ 其后接 rm → deny（r7 全剥 CR 后唯一性破）",
           not gdoc.classify("~/.gan-zhong-xue/gzx-append.sh map <<'E'\nE\r\r\n"
                             "rm ~/.gan-zhong-xue/map.md\nE").allow)
+    # G17-G21:r12(GPT 外审八轮 P1/P2)——引导豁免收紧的边界负例（与 selftest 同源钉双侧）
+    check("G17 cp 源名合法改名件覆盖 map.md → deny（目标文件名层）",
+          not gdoc.classify("cp /tmp/evil/gzx-append.sh ~/.gan-zhong-xue/map.md").allow)
+    check("G18 cp 改名件覆盖写入器本体 → deny（来源合法性层）",
+          not gdoc.classify("cp /tmp/evil/gzx-append.sh ~/.gan-zhong-xue/gzx-append.sh").allow)
+    check("G19 chmod 000 数据资产 → deny（chmod 仅初始化形状）",
+          not gdoc.classify("chmod 000 ~/.gan-zhong-xue/map.md").allow)
+    check("G20 chmod 000 写入器 → deny（权限清零使机制失效）",
+          not gdoc.classify("chmod 000 ~/.gan-zhong-xue/gzx-append.sh").allow)
+    check("G21 mkdir 数据目录子路径 → deny（mkdir 仅目录本身）",
+          not gdoc.classify("mkdir ~/.gan-zhong-xue/sub").allow)
+    shutil.rmtree("/tmp/gzx-fake-skill-dir", ignore_errors=True)
 
     print("\\n%s：%d 项失败" % ("FAILED" if FAILS else "ALL PASS", len(FAILS)))
     return 1 if FAILS else 0

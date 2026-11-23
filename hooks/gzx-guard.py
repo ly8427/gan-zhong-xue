@@ -142,16 +142,23 @@ def _seg_head_is_allowed(seg):
 # V1.1.0（P1-2 引导豁免）：首次安装需要把写入器部署进数据目录并初始化权限——
 # 这三段操作若被守卫拦下，新用户永远装不起来（GPT PR #4 审查 P1-2 实景）。
 # 豁免口径（减速带定位内、逐段可判定）：
-#   cp/install —— V1.1.1 收紧（board #122 M2/dsh §3）：恰 2 参 ∧ 源 basename ∈
-#     {gzx-append.sh, gzx_lock_append.py} ∧ 目标 dirname 解析后 == GZX_DIR。
-#     旧口径（段内含 gzx-append 子串即豁免）可被 `cp /tmp/gzx-append map.md`
-#     一条绕过（append-only 变提示词可达，dsh #2654 §3 实证）。
-#   mkdir/chmod —— 仅当段内引用受保护目录本身（mkdir -p / chmod 700 初始化）。
-# 已接受的余量：chmod 数值不做白名单（用户对自己的数据目录有权变更权限）；
-#   把真写入器复制成数据目录内的别名（如 .bak）仍放行——内容是写入器本体，
-#   不是任意载荷（selftest 在案）。
+#   cp/install —— 恰 3 参 ∧ 源 basename ∈ {gzx-append.sh, gzx_lock_append.py}
+#     ∧ 目标 basename ∈ 同集合 ∧ 目标 dirname 解析后 == GZX_DIR ∧ 来源目录含
+#     SKILL.md（插件束形态判据：写入器与 SKILL.md 同目录随插件分发，SKILL.md:33）。
+#     V1.1.1（board #122 M2/dsh §3）：弃「段内含 gzx-append 子串即豁免」——
+#     `cp /tmp/gzx-append map.md` 一条绕过（dsh #2654 §3 实证）。
+#     r12（GPT 外审八轮 P1）：M2 口径仍漏两格——目标文件名不验（源名合法的改名件
+#     可覆盖 map.md）与来源不验（/tmp/evil/gzx-append.sh 可覆盖写入器本体）→ 本次
+#     补齐；原「真写入器复制成 .bak 别名仍放行」余量随目标名检查一并收回（selftest 移 deny）。
+#   mkdir —— 仅准建数据目录本身（r12 GPT 外审八轮 P2：不再泛化到任意子路径）。
+#   chmod —— 仅两种初始化形状：写入器授执行（mode 同时含 + 与 x）与数据目录
+#     owner-rwx（数值三位且首位 7）。r12（GPT 外审八轮 P2）：弃「chmod 数值不做
+#     白名单」旧余量——chmod 000 可清零写入器/数据资产权限使机制失效。
+#   mkdir/chmod 段内的单字符数字视为 fd 尾巴剥除（`2>/dev/null` 经重定向层剥离后
+#     会把裸 `2` 残进段——"700" 三位数字不受扰）。
 _BOOTSTRAP_SRC_NAMES = {"gzx-append.sh", "gzx_lock_append.py"}
 _BOOTSTRAP_SETUP = {"mkdir", "chmod"}
+_PLUGIN_BUNDLE_MARK = "SKILL.md"
 
 
 def _seg_is_bootstrap(seg):
@@ -159,12 +166,51 @@ def _seg_is_bootstrap(seg):
     if head in ("cp", "install"):
         if len(seg) != 3:
             return False
-        src = seg[1].rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
-        dst_dir = os.path.dirname(os.path.expanduser(seg[2]))
-        return (src in _BOOTSTRAP_SRC_NAMES
-                and _canon_path(dst_dir) == _canon_path(GZX_DIR))
+        src_path = os.path.expanduser(seg[1])
+        src = src_path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        dst_path = os.path.expanduser(seg[2])
+        dst = dst_path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        dst_dir = os.path.dirname(dst_path)
+        if (src not in _BOOTSTRAP_SRC_NAMES
+                or dst not in _BOOTSTRAP_SRC_NAMES
+                or _canon_path(dst_dir) != _canon_path(GZX_DIR)):
+            return False
+        # 来源合法性（r12 GPT 外审八轮 P1）：源必须随插件束分发（所在目录含 SKILL.md），
+        # 防 /tmp 改名件借豁免覆盖数据资产或写入器本体。路径先过 _normalize_dir 跨形态
+        # 换算（MSYS /c/ 形态在 Windows python 里直接 isfile 会查错盘——B1 一手实证）；
+        # 相对路径按仓库根解析（自检可能不从仓库根发起）。
+        src_dir = os.path.dirname(src_path)
+        if _normalize_dir is not None:
+            src_dir = _normalize_dir(src_dir)
+        if not os.path.isabs(src_dir):
+            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            src_dir = os.path.join(repo_root, src_dir)
+        return os.path.isfile(os.path.join(src_dir, _PLUGIN_BUNDLE_MARK))
     if head in _BOOTSTRAP_SETUP:
-        return any(PROTECTED_MARK in t for t in seg[1:])
+        # 单字符数字 = `2>/dev/null` 类 fd 尾巴在重定向层剥离后残进段的残留，剥除
+        #（"700" 三位不受扰——fd 号只有 0-2 一位）。
+        args = [t for t in seg[1:] if not (t.isdigit() and len(t) == 1)]
+        # shlex 非 wordchar 切分：'chmod +x P' 实到段为 ['chmod','+','x','P']（'u+x'
+        # 同理切成三段；'700' 数字是 wordchar 不切）——mode=路径样 token 之前的短
+        # token 拼接，target=唯一路径样 token。
+        pathish = [t for t in args if ("/" in t or "\\" in t or t.startswith("~"))]
+        if head == "mkdir":
+            # mkdir 的目标本身就是路径 token（pathish 是 chmod 的 mode/target 拆分，不适用于此）
+            targets = [t for t in args if not t.startswith("-")]
+            return (bool(targets)
+                    and all(_canon_path(t) == _canon_path(GZX_DIR) for t in targets))
+        modeparts = [t for t in args if t not in pathish]
+        if len(pathish) != 1 or not modeparts:
+            return False
+        mode = "".join(modeparts)
+        if mode.startswith("-"):                 # 旗标形态（-R 等）fail-closed 不豁免
+            return False
+        target = pathish[0]
+        if _canon_path(target) == _writer_installed_path():
+            return "+" in mode and "x" in mode   # 授执行形态（+x/a+x/u+x…）
+        if _canon_path(target) == _canon_path(GZX_DIR):
+            return mode.isdigit() and len(mode) == 3 and mode[0] == "7"
+        return False
     return False
 
 
@@ -393,9 +439,8 @@ def selftest():
         "gzx-append map",                                    # 写入器：PATH 直调（范围外，顺带验）
         "cat payload | gzx-append candidates",               # 写入器：管道段尾
         "bash ~/.gan-zhong-xue/gzx-append.sh map",           # 写入器：shell 包装
-        # V1.1.0(P1-2):首次安装引导三段——部署写入器/建目录/收权限
+        # V1.1.0(P1-2):首次安装引导——部署写入器/建目录/收权限（.bak 别名余量 r12 收回，移 deny）
         "cp skills/gan-zhong-xue/gzx-append.sh ~/.gan-zhong-xue/gzx-append.sh",
-        "cp ~/.gan-zhong-xue/gzx-append.sh ~/.gan-zhong-xue/gzx_lock_append.py.bak",
         "mkdir -p ~/.gan-zhong-xue",
         "chmod 700 ~/.gan-zhong-xue",
         # V1.1.1(board #122 M1/M2):SKILL.md 第 -1 步改版后的单句引导与自检
@@ -429,6 +474,15 @@ def selftest():
         ("cp /tmp/gzx-append ~/.gan-zhong-xue/map.md", "prefix:cp"),      # 源非写入器两件
         ("cp /tmp/evil ~/.gan-zhong-xue/gzx-append.sh", "prefix:cp"),     # 覆盖写入器本体
         ("cp a ~/.gan-zhong-xue/gzx-append.sh b", "prefix:cp"),           # 非 2 参不豁免
+        # r12(GPT 外审八轮 P1/P2):目标文件名+来源合法性+chmod 形状收紧的负向用例
+        ("cp /tmp/evil/gzx-append.sh ~/.gan-zhong-xue/map.md", "prefix:cp"),         # 源名合法但目标=数据资产
+        ("cp /tmp/evil/gzx-append.sh ~/.gan-zhong-xue/gzx-append.sh", "prefix:cp"),  # 来源目录无 SKILL.md（改名件）
+        ("cp ~/.gan-zhong-xue/gzx-append.sh ~/.gan-zhong-xue/gzx_lock_append.py.bak",
+         "prefix:cp"),                                                    # .bak 别名余量收回（目标名不合法）
+        ("chmod 000 ~/.gan-zhong-xue/map.md", "prefix:chmod"),            # 数据资产改权限
+        ("chmod 000 ~/.gan-zhong-xue/gzx-append.sh", "prefix:chmod"),     # 写入器权限清零
+        ("chmod -R 700 ~/.gan-zhong-xue", "prefix:chmod"),                # 旗标形态 fail-closed
+        ("mkdir ~/.gan-zhong-xue/sub", "prefix:mkdir"),                   # 子路径不豁免
         # M2-ext 负向:heredoc 例外不可被滥用
         ("~/.gan-zhong-xue/gzx-append.sh map <<'E'\nx\nE\nrm ~/.gan-zhong-xue/map.md",
          "structure"),                                                    # 定界符后接命令
