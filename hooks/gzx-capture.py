@@ -81,15 +81,21 @@ def _lex(cmd):
     后处理：一个独立的 `:` 词元，若它**不是段首**（前一词存在且不是边界符）且
     **后一词存在且不是边界符**，视为同一个词被切碎 ⇒ 前后接回。
     段首的 `:`（shell 的 no-op 内建命令，如 `: && git commit`）不接回。
+    v1.1.2（Bugbot 4670188696）：`$` 不在 shlex 默认词字符表里，**永远被切成独立
+    词元**——`PATH=$PATH:/x` 被切成 ['PATH=','$','PATH:/x']，环境赋值跳过匹配不到
+    ⇒ 漏掉真提交。修法=把 `$` 加进 wordchars（`$VAR`、`$$`、`$(…` 保持完整词元；
+    `$(` 的 `(` 仍是边界符，命令替换形态不受影响）。
     不可解析（引号未闭合等）→ 返回 None（漏报优于误报，与 P1-5 同向）。"""
     try:
         lex = shlex.shlex(cmd, posix=True, punctuation_chars="();<>|&\n")
         lex.whitespace_split = False
         lex.whitespace = " \t\r"
         lex.commenters = ""
+        lex.wordchars += "$"
         raw = list(lex)
     except ValueError:
         return None
+    # 冒号接回（见上）
     merged = []
     i = 0
     n = len(raw)
@@ -181,8 +187,11 @@ def _is_git_commit_segment(seg):
             i += 1
     if i >= len(seg):
         return False
-    git_prog = seg[i].rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
-    if git_prog != "git":
+    # 程序名识别（v1.1.2 Bugbot 4670188716）：basename 恰为 git 或 git.exe
+    # （Windows 可执行文件名带 .exe；大小写不敏感——Windows 文件名不区分大小写）。
+    # 旧判定 startswith("git") 能识别 git.exe，本层不得回退。
+    git_prog = seg[i].rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
+    if git_prog not in ("git", "git.exe"):
         return False
     i = _skip_git_globals(seg, i + 1)
     return i < len(seg) and seg[i] == "commit"

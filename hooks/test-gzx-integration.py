@@ -215,6 +215,8 @@ def _run(work):
         "git -C '%s' commit -m x" % repo.replace("\\", "/"),   # 全局选项 -C（盘符+正斜杠，冒号接回）
         "git --no-pager commit --amend --no-edit",        # 全局旗标 + 子命令选项
         "git add -A && git commit -m gen && git push",    # 命令链中段
+        "git.exe commit -m x",                            # r17 Bugbot 4670188716：Windows .exe 形态
+        "PATH=$PATH:/bin git commit -m x",                # r17 Bugbot 4670188696：env 值含 $
     ]
     d5_ok, d5_detail = True, ""
     for n, command in enumerate(forms, start=1):

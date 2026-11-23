@@ -319,6 +319,12 @@ def test_commit_command_recognition():
         "if true; then git commit -m x; fi",
         "PATH=/usr/bin:/bin git commit -m x",
         ": && git commit -m x",                             # 段首 no-op 内建命令
+        # v1.1.2 Bugbot 4670188716/4670188696：Windows git.exe 与 $ 环境值
+        "git.exe commit -m fix",
+        "Git.EXE commit -m fix",
+        "PATH=$PATH:/x git commit -m y",                    # env 值含 $（$ 加进 wordchars）
+        "FOO=$(date) git commit -m x",                      # env 值含命令替换
+        "git -C C:/repo commit -m x",                       # 盘符冒号接回
     ]
     # 不应识别（命令里出现 commit 字样，但不是在执行 git commit）
     no = [
@@ -349,6 +355,10 @@ def test_commit_command_recognition():
         "GIT_CMD=C:/x/git commit",               # 命令是名为 commit 的程序
         "C:/tools/gitk commit",
         "sudo git commit -m x",                  # sudo 后的命令：不识别（漏报方向，如实登记）
+        "git.exe",                               # 只有程序名没有子命令
+        "git.exe status",                        # .exe 程序但子命令不是 commit
+        "git.exe --version",
+        "$GIT_BIN commit -m x",                  # 变量存放的 git：不识别（漏报方向）
         "gh commit",
         "",
         "   ",
