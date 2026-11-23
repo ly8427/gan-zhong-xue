@@ -63,9 +63,9 @@ def main():
     os.makedirs(os.path.join(gzx_dir, "data"), exist_ok=True)
     os.makedirs(repo, exist_ok=True)
     os.makedirs(skill_dir, exist_ok=True)
-    # 技能目录放一份写入器（模拟插件分发件；SKILL.md 自 r12 起是 B1 来源合法性判据——
-    # 守卫要求 cp 源所在目录含 SKILL.md（插件束形态），夹具必须长成真插件束）
-    for f in ("SKILL.md", "gzx-append.sh", "gzx_lock_append.py"):
+    # 技能目录放一份写入器（模拟插件分发件——A 段真实文件操作用；B1 的守卫判定
+    # 自 r13 起要求来源=守卫所在插件包的真实技能目录，不再认任何临时假束）
+    for f in ("gzx-append.sh", "gzx_lock_append.py"):
         shutil.copy(os.path.join(SKILL_DIR, f), os.path.join(skill_dir, f))
 
     # ---- A: 首次安装引导（P1-1）----
@@ -90,7 +90,7 @@ def main():
     gmod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(gmod)
     check("B1 cp 安装写入器 → 放行",
-          gmod.classify("cp %s/gzx-append.sh %s/gzx-append.sh" % (_posix(skill_dir), _posix(gzx_dir))).allow)
+          gmod.classify("cp %s/gzx-append.sh %s/gzx-append.sh" % (_posix(SKILL_DIR), _posix(gzx_dir))).allow)
     check("B2 mkdir 初始化 → 放行",
           gmod.classify("mkdir -p %s" % _posix(gzx_dir)).allow)
     check("B3 chmod 收权限 → 放行",
@@ -335,7 +335,7 @@ def main():
         for ln in blk.splitlines():
             ln = ln.strip()
             if ln and not ln.startswith("#"):
-                cmds.append(ln.replace("<SKILL_DIR>", "/tmp/gzx-fake-skill-dir"))
+                cmds.append(ln.replace("<SKILL_DIR>", _posix(SKILL_DIR)))
     # 抽取器变换清单（board #122 dsh #2675 §2，写死防误读）：
     #   {fence dedent（隐含于 splitlines+strip）, CRLF→LF, `<SKILL_DIR>` 占位符替换}
     # ——占位符字面含 <>，会被分词器切进重定向层使段长 ≠ 3（prefix:cp 假红），
@@ -343,12 +343,9 @@ def main():
     bad_xform = [c for c in cmds if "<SKILL_DIR" in c]
     check("G1a 抽取器变换后无 <SKILL_DIR> 占位符残留", not bad_xform,
           "; ".join(repr(c) for c in bad_xform))
-    # r12(GPT 外审八轮 P1):守卫来源合法性判据=cp 源目录含 SKILL.md——占位符替换后的
-    # 假插件目录必须长成真插件束，否则块 2 的 cp 命令会因来源检查假红。
-    fake_skill = "/tmp/gzx-fake-skill-dir"
-    os.makedirs(fake_skill, exist_ok=True)
-    for f in ("SKILL.md", "gzx-append.sh", "gzx_lock_append.py"):
-        shutil.copy(os.path.join(SKILL_DIR, f), os.path.join(fake_skill, f))
+    # r13(GPT 外审九轮 P1):守卫来源身份=守卫所在插件包的真实技能目录——占位符
+    # 替换值必须是真插件目录（本测试即 SKILL_DIR=仓库技能目录），不再喂假束：
+    # 假束（含 SKILL.md）自 r13 起一律 deny（见 G22），喂假束会反向假红。
     bad = [(c, gdoc.classify(c)) for c in cmds if not gdoc.classify(c).allow]
     check("G1 第 -1 步文档字节逐条 classify 全 allow", not bad,
           "; ".join("%r -> %s" % (c, d.rule) for c, d in bad))
@@ -421,7 +418,7 @@ def main():
     check("G15a <SKILL_DIR> 占位符字面 → deny（占位符不可直接执行）",
           not gdoc.classify("cp <SKILL_DIR>/gzx-append.sh ~/.gan-zhong-xue/gzx-append.sh").allow)
     check("G15b 占位符替换成实路径 → allow（G1 已覆盖,此处单独钉）",
-          gdoc.classify("cp /tmp/gzx-fake-skill-dir/gzx-append.sh ~/.gan-zhong-xue/gzx-append.sh").allow)
+          gdoc.classify("cp %s/gzx-append.sh ~/.gan-zhong-xue/gzx-append.sh" % _posix(SKILL_DIR)).allow)
     check("G16 正文多 CR（E\\r\\r）+ 其后接 rm → deny（r7 全剥 CR 后唯一性破）",
           not gdoc.classify("~/.gan-zhong-xue/gzx-append.sh map <<'E'\nE\r\r\n"
                             "rm ~/.gan-zhong-xue/map.md\nE").allow)
@@ -436,7 +433,19 @@ def main():
           not gdoc.classify("chmod 000 ~/.gan-zhong-xue/gzx-append.sh").allow)
     check("G21 mkdir 数据目录子路径 → deny（mkdir 仅目录本身）",
           not gdoc.classify("mkdir ~/.gan-zhong-xue/sub").allow)
-    shutil.rmtree("/tmp/gzx-fake-skill-dir", ignore_errors=True)
+    # G22:r13(GPT 外审九轮 P1)——SKILL.md 形态标记可伪造：真造一个带 SKILL.md 的假
+    # 插件束（含同名写入器），来源身份按路径精确相等判定 ⇒ 必 deny。这正是 r12
+    # 形态检查会放行、r13 收紧后的关键负例（GPT 点名形状）。
+    fake_plugin = "/tmp/gzx-fake-plugin"
+    os.makedirs(fake_plugin, exist_ok=True)
+    for f in ("SKILL.md", "gzx-append.sh", "gzx_lock_append.py"):
+        shutil.copy(os.path.join(SKILL_DIR, f), os.path.join(fake_plugin, f))
+    check("G22 假插件束（SKILL.md+同名写入器）覆盖写入器 → deny（来源身份层）",
+          not gdoc.classify("cp /tmp/gzx-fake-plugin/gzx-append.sh ~/.gan-zhong-xue/gzx-append.sh").allow)
+    shutil.rmtree(fake_plugin, ignore_errors=True)
+    # G23:r13(GPT 外审九轮 P2)——首位 7 不再放行 750/755/777，恰 700 才豁免
+    check("G23 chmod 777 数据目录 → deny（本地数据隐私,仅 700）",
+          not gdoc.classify("chmod 777 ~/.gan-zhong-xue").allow)
 
     print("\\n%s：%d 项失败" % ("FAILED" if FAILS else "ALL PASS", len(FAILS)))
     return 1 if FAILS else 0

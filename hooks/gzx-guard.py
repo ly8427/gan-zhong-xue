@@ -143,22 +143,34 @@ def _seg_head_is_allowed(seg):
 # 这三段操作若被守卫拦下，新用户永远装不起来（GPT PR #4 审查 P1-2 实景）。
 # 豁免口径（减速带定位内、逐段可判定）：
 #   cp/install —— 恰 3 参 ∧ 源 basename ∈ {gzx-append.sh, gzx_lock_append.py}
-#     ∧ 目标 basename ∈ 同集合 ∧ 目标 dirname 解析后 == GZX_DIR ∧ 来源目录含
-#     SKILL.md（插件束形态判据：写入器与 SKILL.md 同目录随插件分发，SKILL.md:33）。
+#     ∧ 目标 basename ∈ 同集合 ∧ 目标 dirname 解析后 == GZX_DIR ∧ **来源身份**：
+#     源 canonical path 必须与守卫所在插件包技能目录（hooks/../skills/gan-zhong-xue）
+#     内的同名官方文件完全一致。
 #     V1.1.1（board #122 M2/dsh §3）：弃「段内含 gzx-append 子串即豁免」——
 #     `cp /tmp/gzx-append map.md` 一条绕过（dsh #2654 §3 实证）。
-#     r12（GPT 外审八轮 P1）：M2 口径仍漏两格——目标文件名不验（源名合法的改名件
-#     可覆盖 map.md）与来源不验（/tmp/evil/gzx-append.sh 可覆盖写入器本体）→ 本次
-#     补齐；原「真写入器复制成 .bak 别名仍放行」余量随目标名检查一并收回（selftest 移 deny）。
+#     r12（GPT 外审八轮 P1）：M2 口径漏两格——目标文件名不验与来源不验 → 补
+#     「来源目录含 SKILL.md」形态检查。
+#     r13（GPT 外审九轮 P1）：形态检查仍可伪造——/tmp/evil 里 touch 一个 SKILL.md
+#     + 放同名写入器即满足；且本仓集成测试自建 /tmp 假插件束当合法来源恰好自证此漏。
+#     → 弃形态判据，改**来源身份精确相等**（守卫位置即插件安装位置，写入器随包分发，
+#     二者由同一布局构造保证；SKILL.md 存在性不再参与判定）。
 #   mkdir —— 仅准建数据目录本身（r12 GPT 外审八轮 P2：不再泛化到任意子路径）。
 #   chmod —— 仅两种初始化形状：写入器授执行（mode 同时含 + 与 x）与数据目录
-#     owner-rwx（数值三位且首位 7）。r12（GPT 外审八轮 P2）：弃「chmod 数值不做
-#     白名单」旧余量——chmod 000 可清零写入器/数据资产权限使机制失效。
+#     **恰 700**。r12（GPT 外审八轮 P2）：弃「chmod 数值不做白名单」旧余量——chmod 000
+#     可清零写入器/数据资产权限使机制失效。r13（GPT 外审九轮 P2）：首位 7 仍放进
+#     750/755/777，与本地数据隐私立场冲突 → 收窄为恰 "700"（文档初始化只用该值）。
 #   mkdir/chmod 段内的单字符数字视为 fd 尾巴剥除（`2>/dev/null` 经重定向层剥离后
 #     会把裸 `2` 残进段——"700" 三位数字不受扰）。
 _BOOTSTRAP_SRC_NAMES = {"gzx-append.sh", "gzx_lock_append.py"}
 _BOOTSTRAP_SETUP = {"mkdir", "chmod"}
-_PLUGIN_BUNDLE_MARK = "SKILL.md"
+
+
+def _plugin_skill_dir():
+    """r13（GPT 外审九轮 P1）：写入器合法来源 = 本守卫所在插件包内的真实技能目录
+    （hooks/../skills/gan-zhong-xue）。守卫位置即插件安装位置，写入器随同一包分发，
+    二者由布局构造保证——不依赖任何可伪造的目录内标记文件。"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(os.path.dirname(here), "skills", "gan-zhong-xue")
 
 
 def _seg_is_bootstrap(seg):
@@ -175,17 +187,12 @@ def _seg_is_bootstrap(seg):
                 or dst not in _BOOTSTRAP_SRC_NAMES
                 or _canon_path(dst_dir) != _canon_path(GZX_DIR)):
             return False
-        # 来源合法性（r12 GPT 外审八轮 P1）：源必须随插件束分发（所在目录含 SKILL.md），
-        # 防 /tmp 改名件借豁免覆盖数据资产或写入器本体。路径先过 _normalize_dir 跨形态
-        # 换算（MSYS /c/ 形态在 Windows python 里直接 isfile 会查错盘——B1 一手实证）；
-        # 相对路径按仓库根解析（自检可能不从仓库根发起）。
-        src_dir = os.path.dirname(src_path)
-        if _normalize_dir is not None:
-            src_dir = _normalize_dir(src_dir)
-        if not os.path.isabs(src_dir):
-            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            src_dir = os.path.join(repo_root, src_dir)
-        return os.path.isfile(os.path.join(src_dir, _PLUGIN_BUNDLE_MARK))
+        # 来源身份（r13 GPT 外审九轮 P1，取代 r12 的 SKILL.md 形态检查）：源
+        # canonical path 必须与插件包技能目录内的同名官方文件完全一致——
+        # _canon_path 内含 _normalize_dir 跨形态换算（MSYS /c/ 形态 B1 一手实证）
+        # 与 realpath 归一。
+        return _canon_path(src_path) == _canon_path(
+            os.path.join(_plugin_skill_dir(), src))
     if head in _BOOTSTRAP_SETUP:
         # 单字符数字 = `2>/dev/null` 类 fd 尾巴在重定向层剥离后残进段的残留，剥除
         #（"700" 三位不受扰——fd 号只有 0-2 一位）。
@@ -209,7 +216,7 @@ def _seg_is_bootstrap(seg):
         if _canon_path(target) == _writer_installed_path():
             return "+" in mode and "x" in mode   # 授执行形态（+x/a+x/u+x…）
         if _canon_path(target) == _canon_path(GZX_DIR):
-            return mode.isdigit() and len(mode) == 3 and mode[0] == "7"
+            return mode == "700"   # r13(GPT 外审九轮 P2):恰 700——首位 7 会放进 777
         return False
     return False
 
@@ -427,6 +434,13 @@ def _handle(event):
 def selftest():
     """D6 安装验收：allow/deny 双侧用例矩阵（#819/#822/#825/#827/#829/#830/#831 用例全量）。
     0 = 全过。两侧都要验——只验 deny 侧等于没验 allow 侧（#815 §3）。"""
+    # r13:来源身份=守卫所在插件包技能目录——cp 允许用例按守卫自身位置解析，
+    # 不再依赖 cwd==仓库根。盘符形态须转 MSYS /c/ 形态：shlex 把 'C:' 的冒号切开
+    # （一手实证：'C:/Users' → ['C',':','/Users/...']），段长≠3 恒 deny——
+    # 与集成套件 F 组"/c/ 才是 Git Bash 挂载点"既有结论同向，套件与文档都用 /c/ 形态。
+    _pkg_skill = _plugin_skill_dir().replace(os.sep, "/")
+    if re.match(r"^[A-Za-z]:/", _pkg_skill):
+        _pkg_skill = "/" + _pkg_skill[0].lower() + _pkg_skill[2:]
     allows = [
         "sha256sum ~/.gan-zhong-xue/map.md",                 # #815 迁移哈希场景
         "grep -i 先猜 ~/.gan-zhong-xue/map.md",              # #817：-i 仅 sed/perl 前缀
@@ -440,12 +454,13 @@ def selftest():
         "cat payload | gzx-append candidates",               # 写入器：管道段尾
         "bash ~/.gan-zhong-xue/gzx-append.sh map",           # 写入器：shell 包装
         # V1.1.0(P1-2):首次安装引导——部署写入器/建目录/收权限（.bak 别名余量 r12 收回，移 deny）
-        "cp skills/gan-zhong-xue/gzx-append.sh ~/.gan-zhong-xue/gzx-append.sh",
+        # r13:源=守卫所在插件包技能目录（身份精确相等,不再按 cwd 相对解析）
+        "cp %s/gzx-append.sh ~/.gan-zhong-xue/gzx-append.sh" % _pkg_skill,
         "mkdir -p ~/.gan-zhong-xue",
         "chmod 700 ~/.gan-zhong-xue",
         # V1.1.1(board #122 M1/M2):SKILL.md 第 -1 步改版后的单句引导与自检
         "chmod +x ~/.gan-zhong-xue/gzx-append.sh",
-        "cp skills/gan-zhong-xue/gzx_lock_append.py ~/.gan-zhong-xue/gzx_lock_append.py",
+        "cp %s/gzx_lock_append.py ~/.gan-zhong-xue/gzx_lock_append.py" % _pkg_skill,
         "ls ~/.gan-zhong-xue/gzx-append.sh 2>/dev/null",
         "cat ~/.gan-zhong-xue/pending.md 2>/dev/null",
         "cat ~/.gan-zhong-xue/candidates.jsonl 2>/dev/null",
@@ -483,6 +498,10 @@ def selftest():
         ("chmod 000 ~/.gan-zhong-xue/gzx-append.sh", "prefix:chmod"),     # 写入器权限清零
         ("chmod -R 700 ~/.gan-zhong-xue", "prefix:chmod"),                # 旗标形态 fail-closed
         ("mkdir ~/.gan-zhong-xue/sub", "prefix:mkdir"),                   # 子路径不豁免
+        # r13(GPT 外审九轮 P1/P2):来源身份精确相等 + chmod 恰 700 的负例
+        ("cp /tmp/fake-plugin/gzx-append.sh ~/.gan-zhong-xue/gzx-append.sh", "prefix:cp"),  # 假来源目录(带 SKILL.md 也一样,身份按路径)
+        ("chmod 777 ~/.gan-zhong-xue", "prefix:chmod"),                   # 首位 7 不再放行非 700
+        ("chmod 755 ~/.gan-zhong-xue", "prefix:chmod"),                   # 同上
         # M2-ext 负向:heredoc 例外不可被滥用
         ("~/.gan-zhong-xue/gzx-append.sh map <<'E'\nx\nE\nrm ~/.gan-zhong-xue/map.md",
          "structure"),                                                    # 定界符后接命令
