@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -182,42 +183,58 @@ def main():
         f.write(worker_src)
 
     def spawn_workers(row_objs):
-        # GPT 外审(PR#4 六轮): 光"预写 stdin 文件"仍非确定性——worker 启动时刻
-        # 由 OS 调度,争用可能不发生。加同步屏障:每个 worker 先自旋等放行文件,
-        # 全部就位后测试统一放行 ⇒ 争用确定性发生(flock 必被同刻争抢)。
-        barrier = os.path.join(tempfile.mkdtemp(prefix="gzx-e2e-bar-"), "GO")
+        # GPT 外审(PR#4 六/七轮): 双阶段屏障——worker 启动后先写自己的 READY
+        # 文件再等 GO；父进程等齐全部 READY(30s 超时)才放行 GO。Popen 返回≠
+        # worker 就绪,单 GO 文件仍可能串行;双阶段才保证争用确定性发生。
+        # 超时 ⇒ 杀 worker(其 rc 非 0 ⇒ 用例自然红)。
+        bar_dir = tempfile.mkdtemp(prefix="gzx-e2e-bar-")
+        go_path = os.path.join(bar_dir, "GO")
         bootstrap = (
             "import os, sys, time, runpy\n"
-            "bar, worker, data = sys.argv[1], sys.argv[2], sys.argv[3]\n"
+            "bar, worker, data, ready = sys.argv[1:5]\n"
+            "open(ready, 'w').close()\n"
             "while not os.path.exists(bar):\n"
             "    time.sleep(0.005)\n"
             "sys.argv = [worker, data]\n"
             "sys.stdin = open(data, 'r', newline='')\n"
-            "runpy.run_path(worker, run_name='__main__')\n")
-        procs = []
-        for row_obj in row_objs:
+            "runpy.run_path(worker, run_name='__main__')\n"
+        )
+        procs, readies, infiles = [], [], []
+        for i, row_obj in enumerate(row_objs):
             infile = tempfile.NamedTemporaryFile(
                 "wb", prefix="gzx-e2e-", suffix=".json", delete=False)
             infile.write((json.dumps(row_obj, ensure_ascii=False) + "\n").encode("utf-8"))
             infile.close()
+            ready = os.path.join(bar_dir, "ready-%d" % i)
+            readies.append(ready)
+            infiles.append(infile.name)
             pr = subprocess.Popen(
-                [sys.executable, "-c", bootstrap, barrier, worker_py, infile.name],
+                [sys.executable, "-c", bootstrap, bar_dir, worker_py,
+                 infile.name, ready],
                 stdin=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env)
-            procs.append((pr, infile.name))
-        # 全部 worker 已在屏障前自旋——放行,真并发开始
-        with open(barrier, "w") as _g:
+            procs.append(pr)
+        # 等齐全部 READY(30s);超时 ⇒ 杀 worker(rc 非 0 ⇒ 用例红,不留假绿)
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if all(os.path.exists(r) for r in readies):
+                break
+            time.sleep(0.02)
+        if not all(os.path.exists(r) for r in readies):
+            for pr in procs:
+                pr.kill()
+        with open(go_path, "w") as _g:
             _g.write("go")
         outs = []
-        for pr, _infile in procs:
+        for pr, infile_name in zip(procs, infiles):
             _, err = pr.communicate(timeout=30)
             outs.append((pr.returncode, err.decode("utf-8", "replace")))
-        for _, infile_name in procs:
+        for infile_name in infiles:
             try:
                 os.unlink(infile_name)
             except OSError:
                 pass
         try:
-            shutil.rmtree(os.path.dirname(barrier), ignore_errors=True)
+            shutil.rmtree(bar_dir, ignore_errors=True)
         except OSError:
             pass
         return outs

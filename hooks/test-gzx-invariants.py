@@ -339,6 +339,13 @@ def test_capture_exception_silent_by_default():
     """GPT 外审(PR#4 五轮): 默认异常路径真静默——无 stderr traceback、
     不创建 capture-trace.txt;RG_CAPTURE_DEBUG 开启才输出诊断。"""
     d = tempfile.mkdtemp(prefix="gzx-cap-neg-")
+    try:
+        _capture_neg_body(d)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _capture_neg_body(d):
     ev = json.dumps({"tool_name": "Bash",
                      "tool_input": {"command": "git status"},
                      "cwd": os.getcwd(),
