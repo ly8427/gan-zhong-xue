@@ -199,8 +199,12 @@ def _is_git_commit_segment(seg):
                 break
             if w in ("-u", "--unset", "-C", "--chdir", "-S", "--split-string"):
                 i += 2                          # 带值选项：值是下一个词
-            elif w in ("-i", "--ignore-environment", "-0", "--null", "-v", "--verbose",
+            elif w in ("-i", "--ignore-environment", "-0", "--null", "-v", "--debug",
+                       "-", "--list-signal-handling",
                        "--block-signal", "--default-signal", "--ignore-signal"):
+                # v1.1.2（Bugbot 4674364435）：-v 的长选项是 --debug 不是 --verbose
+                # （对齐 `env --help`）；`-` 单独出现等价于 -i（env --help 明载）；
+                # --list-signal-handling 是无参旗标（此前漏登记）。
                 i += 1                          # 无参旗标
             elif w.startswith("--") and "=" in w:
                 i += 1                          # 内联值：--unset=X 等

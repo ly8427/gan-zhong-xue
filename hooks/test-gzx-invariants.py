@@ -309,6 +309,9 @@ def test_commit_command_recognition():
         "env -S '-u FOO' git commit -m x",
         "env -- /usr/bin/git commit -m x",                  # -- 后全是位置参数
         "env FOO=bar -v git commit -m x",
+        "env --debug git commit -m x",                      # v1.1.2 Bugbot 4674364435：-v 的长选项是 --debug
+        "env - git commit -m x",                            # v1.1.2：单独 - 等价 -i（env --help 明载）
+        "env --list-signal-handling git commit -m x",       # v1.1.2：无参旗标补登记
         "FOO=bar git commit -m x",
         "env -i FOO=bar /usr/bin/git commit",
         "git add -A && git commit -m a && git push",
@@ -372,6 +375,7 @@ def test_commit_command_recognition():
         "env grep commit",
         "env -- echo git commit",
         "env -u HTTP_PROXY git status",
+        "env --verbose git commit",                  # v1.1.2 Bugbot 4674364435：--verbose 不是 env 选项 ⇒ 不豁免
         "gh commit",
         "",
         "   ",

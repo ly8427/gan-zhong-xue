@@ -219,6 +219,7 @@ def _run(work):
         "PATH=$PATH:/bin git commit -m x",                # r17 Bugbot 4670188696：env 值含 $
         "env -u HTTP_PROXY git commit -m x",              # r18 GPT 十一轮 P2：env 带参选项 -u
         "env -C %s git commit -m x" % _posix(repo),       # r18 GPT 十一轮 P2：env 带参选项 -C
+        "env --debug git commit -m x",                    # r19 Bugbot 4674364435：-v 的长选项是 --debug
     ]
     d5_ok, d5_detail = True, ""
     for n, command in enumerate(forms, start=1):
