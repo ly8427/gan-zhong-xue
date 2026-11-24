@@ -1,5 +1,129 @@
 # Changelog
 
+## v1.1.2 — 2026-11-21
+
+**board #122 r8 修复批次（pi #2737/#2776 第五版定版）+ 用户 PR#4 follow-up（P1/P2）+ Bugbot 两轮五项。**
+
+- **pending 唯一清空通道**：写入器新增 `pending-clear` 动词（锁内核截断，flock /
+  python 核心 `--truncate pending` 双路径同语义；缺文件=本就为空，存在性检查
+  在锁内——用户 follow-up P1 竞态收口）；append-only 资产
+  （map/jsonl/candidates/audit）到不了截断分支（lock_truncate 显式拒绝 21）。
+- **静态围栏**：不变量套件新增 B2（截断调用恰 1 处且仅在 lock_truncate 内）、
+  B3（pending-only 守卫在位）、B1b 三条可数断言（截断重定向恰两具名站点/
+  总数钉死/资产名禁入右值）；版本面单点断言三件套（七处头注==权威值）。
+- **并发测试重写真跑**：worker 落临时文件（真换行）、回收 rc、先全启后统收
+  （真争用）——E1 两行都在 / E2 seq 唯一连续 / E3 同 sha 零新增。
+- **用户 follow-up**：P2 发布元数据同步（marketplace 1.0.8→1.1.1→1.1.2 与
+  plugin.json 一致，新增双文件一致性灯）；M3 机械版端到端验收（隔离 HOME
+  按文档安装→写入→读回→错误路径）。
+
+## v1.1.1 — 2026-11-20
+
+**board #122 评审收口：修"守卫与文档互咬"的三处断链（M1 执行位 / M2 引导豁免收紧 / M2-ext writer-heredoc）。评审带账项见 `docs/DEBT.md`（D1 tmp 泄漏、D2 双地图发散——带可执行验收，不挡合并）。**
+
+- **M1 执行位断链**：写入器两件在 git 树中均 100644，引导安装只 `cp` 不 `chmod`；
+  旧自检走 `bash` 前缀（不需要执行位）必过、正式保存按文档直执行必炸——每台
+  新机的确定性断链。修复：引导块加单独一句 `chmod +x`（不得写成 `cp && chmod`，
+  结构层会拒）；自检改**直执行**（`gzx-append.sh badtarget </dev/null` → rc=21
+  不落盘），与正式保存同一调用形态、对真实安装位断言（旧 `GZX_DIR=$TMPD`
+  临时目录口径作废——它从不触碰真实部署）。
+- **M2 引导命令单句化 + 守卫收紧**（grok #2653/#2658 实跑 + dsh #2654/#2656 读码）：
+  - SKILL.md 第 -1 步重写为单句命令：守卫结构层拒 `&&`/`||`/`;`/命令替换与
+    `[`/`if` 段首，判空改无条件 `cat … 2>/dev/null` 由模型判；`GZX_APP=` 赋值行
+    删除（受保护路径不做段首）。
+  - cp/install 引导豁免收紧：旧口径「段内含 `gzx-append` 子串即豁免」可被
+    `cp /tmp/gzx-append ~/.gan-zhong-xue/map.md` 一条绕过（append-only 变提示词
+    可达）；新口径 = 恰 2 参 ∧ 源 basename ∈ {gzx-append.sh, gzx_lock_append.py}
+    ∧ 目标 dirname 解析后 == 数据目录。
+  - 写入器身份收紧：`_is_writer_token` 从 basename 相等改为**路径解析身份**
+    （expanduser + shutil.which + normcase(realpath) == 数据目录/gzx-append.sh），
+    `/tmp/x/gzx-append` 假绿根除。
+  - py 核心部署顺带修通：旧豁免标记不含 `gzx_lock_append.py`，单句 `cp` 曾被拒。
+- **M2-ext writer-heredoc 例外**：分词器把换行当独立符号（拒集含 `\n`）⇒ 文档
+  教的 heredoc 多行保存命令（SKILL.md 第 3/4 步）在钩子接线后必被拦——**主写
+  路径断链**（host classify 实证，此前无人测过）。守卫新增例外：整条命令 =
+  「写入器路径 target <<定界符 … 定界符」形状（末行锚定）⇒ 只对首行做完整判定，
+  正文按 stdin 数据处理（bash 语义下永不解释）；定界符后接命令、非写入器头的
+  heredoc 照旧拒。
+- **验收绑文档字节**：集成测试 G 组（G1-G7）——抽取器从 SKILL.md 逐字取第 -1 步
+  命令与正式保存 heredoc 喂 `classify` 期望全 allow + 五条负向（两条 cp 绕过、
+  heredoc 后接命令、旧自检整段等）必 deny；`--selftest` 同步扩容。
+- **验证**：守卫 selftest（allow + deny 双侧）+ 不变量 + 集成（含 G 组）全绿，
+  见 PR 描述的证据段。
+
+## v1.1.0 — 2026-11-11
+
+**GPT PR #4 审查收口：5×P1 + 3×P2 全部闭环——安装引导/守卫豁免/原子去重/失败提交不误记/集成测试入仓。**
+
+- **P1-1 首次安装部署写入器**：第 -1 步引导块（`<SKILL_DIR>` 占位）从技能目录
+  复制写入器两件到数据目录；守卫对 cp 写入器 / mkdir / chmod 数据目录三类
+  引导操作放行（拷数据出目录仍拦）。
+- **P1-2 守卫拦自家启动**：同上豁免 + selftest 增 4 allow / 1 deny。
+- **P1-3 pending 直写**：第 4 步改经写入器追加，`>>` 直写违规字样移除。
+- **P1-4 去重非原子**：核心新增 `lock_append_commit_unique`——去重/序号/追加
+  同一临界区；capture 改调它，seq 锁内现算。
+- **P1-5 失败提交记错 HEAD**：capture 以 `[分支 sha]` 成功标记为捕获前提 +
+  与 rev-parse HEAD 复核；失败提交不捕获不误记。
+- **P2-6 写失败反馈**：SKILL 第 3/4 步明确失败必须原样转述 stderr 状态行。
+- **P2-7 审计首行竞态**：hook_alive 预置移入核心锁内（prepend_if_missing）。
+- **P2-8 集成测试入仓**：`hooks/test-gzx-integration.py` 17 项——真实 git 仓库
+  全链路（引导安装 / 守卫豁免与反向拦截 / 审计首行唯一 / 真提交捕获+去重+
+  失败不捕 / 并发恰一行 / pending 写入器追加）。
+- **模块名修正**：`gzx-lock-append.py` → `gzx_lock_append.py`（连字符不可
+  import——v1.0.9 起导入一直失败、被独立部署兜底路径掩盖；GPT 审查 C 组
+  审计首行缺陷的根因）。
+- **跨形态目录规范化**：核心 `_normalize_dir`——POSIX python 收到 `C:\`
+  盘符路径 / Windows python 收到 `/mnt|/c` 形态时自动换算（bash 写入器
+  path B 实证：exec 到 WSL python3 时曾把数据写进字面量 `C:` 相对目录）。
+- **验证**：集成 17 项 + 不变量 40 项 + 守卫 selftest 36 用例全过，随改两遍稳定。
+
+
+## v1.0.9 — 2026-11-10
+
+**修"数据面只有文字约束"（board thread #80 定案 D1-D7）——append-only 从模型自觉变机器不变量，hook 只做减速带+审计。**
+
+- **写入器 `gzx-append.sh`（机制层，双宿主，D2）** —— 所有数据写入（map.md / map.jsonl / pending.md /
+  candidates.jsonl / audit.jsonl）一律经写入器：代码里**只有追加分支**（'ab' 模式，无任何 'w' 路径）；
+  flock(1) 写锁优先、无 flock(1) 环境（Windows Git Bash）用 python 文件锁兜底、**两者皆缺 → 拒绝写并
+  报错（退出码 22），绝不静默降级**；四态退出码 0/21/22/23（成功/目标非法/锁不可用/写失败）+ stderr
+  状态行；**写失败当场明说，不静默丢内容**。第 3 步两处 heredoc 从 `cat >>` 改调写入器——绕过写入器
+  的直写是违规，兜底 hook 会拦。
+- **兜底 hook `hooks/gzx-guard.py`（减速带+审计，D3）** —— PreToolUse（matcher 含 Agent，dsh #811②），
+  判据 = **写能力指向受保护路径**（非元字符黑名单，#817/#819 判定链）：结构层（shlex punctuation_chars
+  开关 + whitespace/commenters 两行修正，#829/#830）拒 `;` `&&` `||` 裸`&` `$(` 反引号 `<(` `>(` 换行
+  与不可解析；重定向层看下一 token 目标（`>` `>>` `>|` `>&` `&>` `&>>` `<>` 全集，`2>&1` 数字目标放行）；
+  前缀层只读白名单（裸 `python3 -c open('w')` 的唯一拦截点，#825）；参数层 find 排除集九项 + sed|perl
+  前缀 `-i`（grep -i 不误伤）。**deny 与 allow 双侧审计**、审计首行 hook_alive（#811① 活体证明），
+  **审计行只含元数据、绝不落命令原文**（D1）。已知残余：`cd` 过去不提名字的写法拦不住——减速带定位。
+- **提交静默捕获 `hooks/gzx-capture.py`（C'，零打扰，D5）** —— PostToolUse 命中 git commit 时只往
+  candidates.jsonl 追加 {sha, add, del, event, seq, ts}：**去重键 (sha,event)**（重试不双计）、**排序键 =
+  seq 行序**（不用时间戳——同秒歧义，board #49 判例）、不写路径不写仓名（隐私铁则）；提醒只在下次
+  skill 第 -1 步兑现。捕获与打扰解耦，"每步提醒=噪声"从根上去掉。
+- **隐私铁则落 D1 可判定值域** —— 脱敏值域 = {脱敏文本(类型化占位符), 弃权串「因隐私约束未保存
+  原文」}；**弃权串是允许值不是缺字段**（机械不变量放行，两套铁则不互斥）；不宣称"已脱敏⇒无敏感值"；
+  禁止借 pending/audit/candidates 绕道；**优先序定案：隐私 > 机制 > 流程 > 原话保真**。
+- **自检分档（D7）** —— 31 条拆为 8 条必答机械项（SKILL.md，可 grep/脚本核验）+ CHECKLIST.md 按需
+  核对项；map 新格强制『先猜』字段（"跳过先猜"从不可见变可追责）；**铁律10 锚补强：锚必须与文件
+  实际内容逐字比对，只验存在性 = 假保险**。
+- **验收三阶段（D6，替代 pi #810 原翻转条件——原条件不可测，作废）** —— ① 安装验收（hook_alive +
+  `--selftest` 双向用例 + 写入器试写）；② 运行健康度（覆盖证据/失败可发现/审计无异常，无阈值失败线）；
+  ③ 拦截有效性（试验参数：窗口内拦截机会 ≥N 且误拦=0；"20%/20 会话"降为试验参数；回访率分母 =
+  已展示候选 + 最小样本量）。发布默认：机制默认开 / hook 默认开可缺席 / 配额永不。
+- **matcher 待验证配置（D4）** —— `hooks/matcher.json` 记录模式与可达性现状（Claude Code 可达 /
+  ZCode 配置面不同待接线），**实测填表前不作任何承诺；"装上即零配置"不进 README**。
+- **迁移验收（dsh #811③）** —— 不重写存量；改前基线（双宿主各自数据目录）：
+  Windows `map.md=3236B sha256:9a5f53c1…`、`map.jsonl=1264B sha256:de7a1bc5…`；
+  WSL `map.md=6635B sha256:8a0e841d…`、`map.jsonl=3396B sha256:6dff27b0…`。
+  写入器只追加 → 改后哈希应与改前一致（test-gzx-invariants.py 断言）。
+- **对评审链的两处偏离（如实记录，留板复核）** —— ① #829 §5 把无空格管道（`grep x map.md|head`）
+  列 deny 用例，与其自身 §2 一手实测（punctuation 词法器下无空格也切出独立 `|`）矛盾；按机制层裁决
+  走两端白名单层（两写法语义全等、无安全差），归 allow 用例；② `<>`（读写打开、不截断）#831 留白，
+  本实现按保守处置纳入重定向目标检查（目标为保护路径才拒）。
+- **工件锚**：基于 v1.0.8（d58560c）；新增 hooks/{gzx-guard.py, gzx-capture.py, hooks.json,
+  matcher.json}、skills/gan-zhong-xue/{gzx-append.sh, CHECKLIST.md}；SKILL.md 修改面：版本头、
+  隐私铁则（D1 值域）、第 -1 步（自检+台账）、第 3 步（写入器+先猜字段）、铁律10（锚比对）、
+  自检（分档）、新验收节、已知局限（分档+机制层五条诚实边界）。
+
 ## v1.0.8 — 2026-10-21
 
 **修 issue #3"委托型深渊"——"先猜"的前提（用户在场过）在委托场景塌了，先发牌、再开问。**

@@ -10,16 +10,27 @@
       "name": "gan-zhong-xue",
       "source": "./",
       "description": "干中学: turn-based guess→reveal→principle loop, cold-read sub-agent, cross-session knowledge map. Cures vibe-coding (delivery up, understanding flat).",
-      "version": "1.0.8",
+      "version": "1.1.2",
       "author": {
         "name": "ly8427"
       },
       "homepage": "https://github.com/ly8427/gan-zhong-xue",
       "repository": "https://github.com/ly8427/gan-zhong-xue",
       "license": "MIT",
-      "keywords": ["learning", "vibe-coding", "skill", "claude-code", "socratic", "understanding"],
+      "keywords": [
+        "learning",
+        "vibe-coding",
+        "skill",
+        "claude-code",
+        "socratic",
+        "understanding"
+      ],
       "category": "workflow",
-      "tags": ["learning", "vibe-coding", "skill"],
+      "tags": [
+        "learning",
+        "vibe-coding",
+        "skill"
+      ],
       "strict": false
     }
   ]
