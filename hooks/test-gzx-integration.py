@@ -217,6 +217,8 @@ def _run(work):
         "git add -A && git commit -m gen && git push",    # 命令链中段
         "git.exe commit -m x",                            # r17 Bugbot 4670188716：Windows .exe 形态
         "PATH=$PATH:/bin git commit -m x",                # r17 Bugbot 4670188696：env 值含 $
+        "env -u HTTP_PROXY git commit -m x",              # r18 GPT 十一轮 P2：env 带参选项 -u
+        "env -C %s git commit -m x" % _posix(repo),       # r18 GPT 十一轮 P2：env 带参选项 -C
     ]
     d5_ok, d5_detail = True, ""
     for n, command in enumerate(forms, start=1):

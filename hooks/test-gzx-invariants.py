@@ -302,6 +302,13 @@ def test_commit_command_recognition():
         'cd /workspace/project && git commit -m "fix"',     # GPT 十轮 P2-1 正例 1
         "/usr/bin/git commit -m fix",                       # GPT 十轮 P2-1 正例 2
         "env GIT_AUTHOR_NAME=test git commit -m fix",       # GPT 十轮 P2-1 正例 3
+        "env -u HTTP_PROXY git commit -m fix",              # GPT 十一轮 P2：env 带参选项 -u
+        "env -C /workspace/project git commit -m fix",      # GPT 十一轮 P2：env 带参选项 -C
+        "env --unset HTTP_PROXY git commit -m fix",
+        "env --chdir=/workspace git commit -m fix",
+        "env -S '-u FOO' git commit -m x",
+        "env -- /usr/bin/git commit -m x",                  # -- 后全是位置参数
+        "env FOO=bar -v git commit -m x",
         "FOO=bar git commit -m x",
         "env -i FOO=bar /usr/bin/git commit",
         "git add -A && git commit -m a && git push",
@@ -359,6 +366,12 @@ def test_commit_command_recognition():
         "git.exe status",                        # .exe 程序但子命令不是 commit
         "git.exe --version",
         "$GIT_BIN commit -m x",                  # 变量存放的 git：不识别（漏报方向）
+        # v1.1.2 GPT 外审十一轮 P2：env 带参选项的值不是程序——识别层在值处停住不算误报
+        "env -u X grep commit",
+        "env -C /r grep commit",
+        "env grep commit",
+        "env -- echo git commit",
+        "env -u HTTP_PROXY git status",
         "gh commit",
         "",
         "   ",

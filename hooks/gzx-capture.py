@@ -180,11 +180,34 @@ def _is_git_commit_segment(seg):
     # 跳过前置环境赋值：FOO=bar git commit …
     while i < len(seg) and _ENV_ASSIGN_RE.match(seg[i]):
         i += 1
-    # env 包装：env [VAR=x …] git commit …
+    # env 包装：env [选项/VAR=x …] git commit …
+    # v1.1.2（GPT 外审十一轮 P2）：env 的选项分「无参」与「带参」两类，旧循环把
+    # 所有 - 开头的词都当无参跳过 ⇒ `env -u HTTP_PROXY git commit` 在 -u 后停在
+    # 变量名上（把变量名当程序名）⇒ 真提交漏捕获。带参选项的值是下一个词。
+    #   无参：-i --ignore-environment -0 --null -v --verbose
+    #         --block-signal --default-signal --ignore-signal（=值内联或省略）
+    #   带参：-u/--unset、-C/--chdir、-S/--split-string（下一个词是值）
+    #   内联值（--unset=X 等）：一个词自足
+    #   `--`：其后全是位置参数（程序+参数），env 部分结束
     if i < len(seg) and seg[i].rsplit("/", 1)[-1] == "env":
         i += 1
-        while i < len(seg) and (_ENV_ASSIGN_RE.match(seg[i]) or seg[i].startswith("-")):
-            i += 1
+        n = len(seg)
+        while i < n:
+            w = seg[i]
+            if w == "--":
+                i += 1
+                break
+            if w in ("-u", "--unset", "-C", "--chdir", "-S", "--split-string"):
+                i += 2                          # 带值选项：值是下一个词
+            elif w in ("-i", "--ignore-environment", "-0", "--null", "-v", "--verbose",
+                       "--block-signal", "--default-signal", "--ignore-signal"):
+                i += 1                          # 无参旗标
+            elif w.startswith("--") and "=" in w:
+                i += 1                          # 内联值：--unset=X 等
+            elif _ENV_ASSIGN_RE.match(w):
+                i += 1                          # env 的 VAR=value 参数
+            else:
+                break                           # 不再是 env 的参数 ⇒ 这是程序名
     if i >= len(seg):
         return False
     # 程序名识别（v1.1.2 Bugbot 4670188716）：basename 恰为 git 或 git.exe
