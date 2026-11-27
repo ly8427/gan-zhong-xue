@@ -49,13 +49,13 @@
 - 地图、pending、任何总结里**禁止写入具体值**（芯片型号、寄存器地址、IP、密钥、公司名、产品名、内部路径）——只记抽象后的概念；实在没法脱敏复述就写弃权串「因隐私约束未保存原文」。
 - **一切只落本地 `~/.gan-zhong-xue/`，永不外传、永不进任何联网报告。**
 
-## 机制层（v1.1.2）：append-only 不靠模型自觉
+## 机制层（v1.2.0）：append-only 不靠模型自觉
 
-- **写入器 `gzx-append.sh`**：地图与台账的写入只经它——代码里只有追加分支（想覆盖都没有入口）、flock 写锁、锁不可用**拒绝写并报错**（不静默降级）。第一次运行会自检写入器并试写，失败会明说。
-- **兜底 hook（Claude Code）**：PreToolUse 拦"绕过写入器直写地图"的命令（deny = 写算子指向 `~/.gan-zhong-xue/`；grep/cat 等只读命令照常放行）；deny 与放行都落一行**本地审计**，审计行只含元数据、不含命令原文。hook 是**减速带不是安全边界**——`cd` 过去不提名字的写法拦不住。
-- **提交静默捕获**：git commit 后静默往 `candidates.jsonl` 记一笔（只有 sha 与增删行数，无路径无仓名）；提醒只在下次你主动唤起 skill 时出现——不打断你的工作。
-- **宿主差异如实说**：Claude Code 插件自带 hooks 接线；**ZCode 侧只有机制层（写入器），没有兜底 hook**——ZCode 的 hook 机制存在但配置面不同，尚未接线实测。两宿主能力**不等价**，不宣称等价。
-- 验收标准与试验参数见 SKILL.md「机制层验收」节；matcher 可达性是**待验证配置**（`hooks/matcher.json`），实测前不作任何承诺。
+- **聚合 CLI `gzx_cli.py` + 写入器 `gzx-append.sh`**：预检（`preflight`）、发散检测与双地图落盘（`save-cell`）收口到确定性 CLI，由 `gzx_lock_append.py` 在同一把排他锁内原子追加 `map.jsonl` 与 `map.md`；锁不可用**拒绝写并报错**（不静默降级）。
+- **兜底 hook（Claude Code）**：PreToolUse 拦"绕过写入器直写 `~/.gan-zhong-xue/`"的命令，范围已收窄至运行时数据目录（不再误伤同仓开发与普通 `Agent`/文档编辑）；deny 与放行都落一行**本地审计**（不含命令原文）。hook 是**减速带不是安全边界**——`cd` 过去不提名字的写法拦不住。
+- **提交静默捕获**：git commit 后静默往 `candidates.jsonl` 记一笔（支持 `root-commit`、`detached HEAD` 与 `cd`/`-C` 目标仓库追踪；只有 sha 与增删行数，无路径无仓名）；提醒只在下次你主动唤起 skill 时出现——不打断你的工作。
+- **宿主差异如实说**：Claude Code 插件自带 hooks 接线；**ZCode 侧只有机制层（写入器/CLI），没有兜底 hook**——ZCode 的 hook 机制存在但配置面不同，尚未接线实测。两宿主能力**不等价**，不宣称等价。
+- 验收标准与机制边界见 [docs/mechanism.md](docs/mechanism.md)；matcher 可达性仍是**待验证配置**（`hooks/matcher.json`），实测前不作任何承诺。
 
 ---
 

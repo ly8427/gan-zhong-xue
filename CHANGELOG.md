@@ -1,5 +1,22 @@
 # Changelog
 
+## v1.2.0 — 2026-11-26
+
+**响应 Issue #6（P0/P1/P2 系统性重构与修复）：聚合 CLI 收口确定性逻辑、收窄守卫误杀面、打通跨平台测试与捕获断层、瘦身 `SKILL.md` 并清零 `docs/DEBT.md` 欠账。**
+
+- **P0 聚合 CLI 与同锁双写（`skills/gan-zhong-xue/gzx_cli.py` + `gzx_lock_append.py`）**：
+  - 新增 `gzx_cli.py`（`preflight` / `cell` / `save-cell` / `pending-add` / `pending-clear` / `check-divergence`），将第 -1 步多条碎命令压缩为单次 `preflight`，并在单锁 `lock_append_map_pair` 内实现 `map.jsonl` 与 `map.md` 的同锁原子追加与字段/单行校验。
+  - 修复 `lock_append_commit_unique` 漏调 `_normalize_dir(gzx_dir)` 的路径一致性问题。
+- **P0 守卫误杀面收窄（`hooks/gzx-guard.py`）**：
+  - `PROTECTED_MARK` 从泛化 `"gan-zhong-xue"` 收窄为 `.gan-zhong-xue` 与实际 `GZX_DIR`，消除对同仓开发、`git commit` 及不含数据目录引用的 `Agent` 提示词误杀；`Write`/`Edit`/`MultiEdit` 改为判定目标文件路径 `file_path`，避免修改仓内文档被拦。
+  - 放行插件官方 `gzx_cli.py`（含 `save-cell` / `pending-add` heredoc），并修复 `gzx-append.sh` heredoc 路径带引号时无法匹配的问题。
+- **P1 捕获断层与跨平台测试修复**：
+  - `hooks/gzx-capture.py`：`_COMMIT_OK_RE` 支持 `(root-commit)` 与 `detached HEAD`；新增 `_extract_git_contexts` 追踪命令行中的 `cd`、`env -C`、`git -C`、`--git-dir` 与 `--work-tree`，修复 `cwd != 目标仓库` 时的静默漏捕获。
+  - `hooks/test-gzx-integration.py` 与 `hooks/test-gzx-invariants.py`：移除硬编码 Windows Git Bash 路径，Linux/macOS 自动使用系统 `bash`，消除集成测试在 Linux 上的 `FileNotFoundError` 崩溃并激活 Linux 下全部 Bash 写入器测试。
+  - 销账 `docs/DEBT.md` D1（路径 B 放弃 `exec` 改普通调用并清理 `$TMP`）、D2（同锁双写 + `check-divergence`）、D3（引号形态成对正反断言）。
+- **P2 `SKILL.md` 瘦身与分级加载**：
+  - `SKILL.md` 从 ~70KB 精简至精炼运行时指令，掌舵模式走低摩擦快路径；低频分支协议（发牌门 / A/B 岔路 / 复验与 `⏸` 调度）迁至 `skills/gan-zhong-xue/references/branches.md`，冷读模板迁至 `references/subagent-prompt.md`，机制验收与边界论证迁至 `docs/mechanism.md`。
+
 ## v1.1.2 — 2026-11-21
 
 **board #122 r8 修复批次（pi #2737/#2776 第五版定版）+ 用户 PR#4 follow-up（P1/P2）+ Bugbot 两轮五项。**

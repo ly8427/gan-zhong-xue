@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""test-gzx-integration.py — v1.1.2 集成回归（GPT PR #4 审查 P2-8：真实 Git 工作流）。
+"""test-gzx-integration.py — v1.2.0 集成回归（GPT PR #4 审查 P2-8：真实 Git 工作流）。
 
 覆盖（全部在隔离临时目录跑，绝不碰真实 ~/.gan-zhong-xue 或用户仓库）：
   A. 首次安装引导（P1-1）：数据目录无写入器 → 从技能目录复制 → 写入器可用
@@ -86,6 +86,25 @@ def main():
             print("WARN 集成测试临时目录未能清干净: %s" % work)
 
 
+def _find_bash():
+    """跨平台探测可用 bash：POSIX 直接用系统 bash；Windows 优先找 Git Bash（避开 WSL）。"""
+    if os.name != "nt":
+        return shutil.which("bash")
+    for cand in (r"C:\Program Files\Git\bin\bash.exe",
+                 r"C:\Program Files\Git\usr\bin\bash.exe"):
+        if os.path.exists(cand):
+            return cand
+    b = shutil.which("bash")
+    if b:
+        try:
+            r = subprocess.run([b, "-c", "uname -s"], capture_output=True, timeout=15)
+            if b"MINGW" in r.stdout or b"MSYS" in r.stdout:
+                return b
+        except Exception:
+            pass
+    return None
+
+
 def _run(work):
     # ---- 场景工作区：真实 git 仓库 + 隔离数据目录 + 模拟插件技能目录 ----
     gzx_dir = os.path.join(work, "data", ".gan-zhong-xue")   # 故意缺写入器（场景 A 前提）
@@ -100,9 +119,9 @@ def _run(work):
         shutil.copy(os.path.join(SKILL_DIR, f), os.path.join(skill_dir, f))
 
     # ---- A: 首次安装引导（P1-1）----
-    # Windows 裸 'bash' 按 PATH 解析（System32\bash.exe=WSL 时读不了 /c/ 路径）——
-    # 钩子的部署形态是 Git Bash（VBS/Host 同款），测试显式锁定同一解释器。
-    GITBASH = r"C:\Program Files\Git\bin\bash.exe"
+    BASH_EXE = _find_bash()
+    if BASH_EXE is None:
+        raise RuntimeError("未找到可用的 bash 可执行文件")
     app_dst = os.path.join(gzx_dir, "gzx-append.sh")
     check("A0 场景前提:数据目录无写入器", not os.path.exists(app_dst))
     # SKILL 第 -1 步引导块的模型侧动作:cp 技能目录两件 → 数据目录
@@ -110,7 +129,7 @@ def _run(work):
     shutil.copy(os.path.join(skill_dir, "gzx_lock_append.py"), os.path.join(gzx_dir, "gzx_lock_append.py"))
     env = dict(os.environ, GZX_DIR=gzx_dir, RB_ROLLOUT_DIR=os.path.join(work, "roll"))
     os.makedirs(env["RB_ROLLOUT_DIR"], exist_ok=True)
-    r = subprocess.run([GITBASH, _posix(app_dst), "pending"],
+    r = subprocess.run([BASH_EXE, _posix(app_dst), "pending"],
                        input=b"bootstrap check\n", capture_output=True, env=env, timeout=30)
     check("A1 部署后的写入器可用", r.returncode == 0, r.stderr.decode(errors="replace")[:150])
 
@@ -273,6 +292,30 @@ def _run(work):
     check("D7 git commit --help 不落账（成功标记防线）", after_help == before_help,
           "before=%d after=%d" % (before_help, after_help))
 
+    # D8（v1.2.0）：当 event.cwd != 目标仓库时，cd <repo> && git commit 与 git -C <repo> commit 也能捕获
+    other_cwd = os.path.join(work, "unrelated_cwd")
+    os.makedirs(other_cwd, exist_ok=True)
+    for tag, cmd_tpl in (
+        ("cd", 'cd %s && git commit -m "cross-cwd"' % _posix(repo)),
+        ("minusC", 'git -C %s commit -m "cross-C"' % _posix(repo)),
+    ):
+        with open(os.path.join(repo, "cross_%s.txt" % tag), "w", encoding="utf-8") as f:
+            f.write(tag + "\n")
+        git("add", "cross_%s.txt" % tag)
+        git("commit", "-m", "cross-" + tag)
+        want_sha = git("rev-parse", "HEAD").stdout.decode().strip()
+        want_short = git("rev-parse", "--short", "HEAD").stdout.decode().strip()
+        run_capture(capture_env(), {
+            "tool_name": "Bash",
+            "cwd": other_cwd,
+            "tool_input": {"command": cmd_tpl},
+            "tool_response": {"output": "[main %s] cross-%s" % (want_short, tag)},
+        })
+        with open(cand, encoding="utf-8") as f:
+            shas_now = [json.loads(l)["sha"] for l in f if l.strip()]
+        check("D8 cwd!=目标仓库时 %s 形态仍能捕获" % tag, want_sha in shas_now,
+              "want=%s" % want_sha[:12])
+
     # 并发:双进程同 sha → 恰 1 行(P1-4 原子性)
     sys.path.insert(0, SKILL_DIR)
     import importlib.util as _iu
@@ -426,7 +469,7 @@ sys.exit(0 if rc == 0 else 4)
     # ---- F: pending 走写入器(P1-3) ----
     r = run_capture(env, {"tool_name": "Read"})  # 触发一次无关调用,确认 pending 仍空
     pend = os.path.join(gzx_dir, "pending.md")
-    rr = subprocess.run([GITBASH, _posix(app_dst), "pending"],
+    rr = subprocess.run([BASH_EXE, _posix(app_dst), "pending"],
                         input="- 未挖点:某机制的并发写安全\n".encode("utf-8"),
                         capture_output=True, env=env, timeout=30)
     check("F1 pending 经写入器追加成功", rr.returncode == 0)
@@ -439,13 +482,34 @@ sys.exit(0 if rc == 0 else 4)
     # F3 pending 清空唯一通道（v1.1.2，Bugbot PR#4 High 端到端回归）：
     # pending-clear 清空 pending.md；append-only 资产 candidates.jsonl 原样。
     cand_before = open(cand, encoding="utf-8").read() if os.path.exists(cand) else ""
-    rr = subprocess.run([GITBASH, _posix(app_dst), "pending-clear"],
+    rr = subprocess.run([BASH_EXE, _posix(app_dst), "pending-clear"],
                         capture_output=True, env=env, timeout=30)
     check("F3a pending-clear rc=0（写入器动词放行且锁内截断）", rr.returncode == 0,
           rr.stderr.decode("utf-8", "replace")[:200])
     check("F3b pending.md 已空", os.path.getsize(pend) == 0)
     check("F3c candidates.jsonl 原样（append-only 不受清空影响）",
           (open(cand, encoding="utf-8").read() if os.path.exists(cand) else "") == cand_before)
+
+    # F4 gzx_cli.py 端到端（preflight → save-cell → cell → check-divergence）
+    cli_py = os.path.join(SKILL_DIR, "gzx_cli.py")
+    r_pf = subprocess.run([sys.executable, cli_py, "preflight"], env=env,
+                          capture_output=True, timeout=30)
+    check("F4a gzx_cli preflight rc=0", r_pf.returncode == 0)
+    r_sc = subprocess.run([sys.executable, cli_py, "save-cell"], env=env,
+                          input=json.dumps({
+                              "概念": "集成测试概念",
+                              "分层": "🟡",
+                              "来源": "🟢自",
+                              "先猜": "先猜原文",
+                              "验证题": "换域迁移题",
+                              "状态": "待复验",
+                          }, ensure_ascii=False).encode("utf-8"),
+                          capture_output=True, timeout=30)
+    check("F4b gzx_cli save-cell rc=0", r_sc.returncode == 0,
+          r_sc.stderr.decode("utf-8", "replace")[:200])
+    r_div = subprocess.run([sys.executable, cli_py, "check-divergence"], env=env,
+                           capture_output=True, timeout=30)
+    check("F4c gzx_cli check-divergence 一致返回 0", r_div.returncode == 0)
 
     # P2（用户 PR#4 follow-up）：插件版本双文件一致性——plugin.json 与
     # marketplace.json 条目版本不得漂移（1.0.8 vs 1.1.1 曾静默并存）。
@@ -513,34 +577,30 @@ sys.exit(0 if rc == 0 else 4)
     bad = [(c, gdoc.classify(c)) for c in cmds if not gdoc.classify(c).allow]
     check("G1 第 -1 步文档字节逐条 classify 全 allow", not bad,
           "; ".join("%r -> %s" % (c, d.rule) for c, d in bad))
-    check("G2 第 -1 步文档命令数≥10（两个块都被抽到）", len(cmds) >= 10, "got %d" % len(cmds))
+    check("G2 第 -1 步文档命令数≥2（preflight 与 cell）", len(cmds) >= 2, "got %d" % len(cmds))
 
-    # 正式保存 heredoc：从全文 bash 围栏里逐字抽「写入器头 + 定界符终结」的完整命令。
-    # 围栏常在 markdown 列表内带缩进——那是排版缩进不是命令字节，真发给 shell 的
-    # 是 dedent 后的形态（bash 语义：空格缩进的定界符行不会终结 heredoc，守卫
-    # 正则因此保持严格，这里必须先 dedent 再喂——钉的就是模型实际会发的那串）。
+    # 正式保存 heredoc：从全文 bash 围栏里逐字抽「CLI / 写入器头 + 定界符终结」的完整命令。
     import textwrap
     save_cmds = []
     for blk in re.findall(r"```bash\n(.*?)```", skill_md, re.S):
-        # CRLF 归一是抽取器的责任、不是判据的例外（board #122 dsh #2662 §3）——
-        # 工作树可能是 CRLF，bash 只认 \n，喂 classify 前必须归一
         lines = textwrap.dedent(blk).replace("\r\n", "\n").replace("\r", "\n").splitlines()
         i = 0
         while i < len(lines):
-            m = re.match(r"^\s*~/.gan-zhong-xue/gzx-append\.sh (map|jsonl|pending) <<'([A-Za-z_]\w*)'\s*$",
-                         lines[i])
+            m = re.match(
+                r"^\s*(?:python3\s+'?<SKILL_DIR>/gzx_cli\.py'?\s+(?:save-cell|pending-add)"
+                r"|~/.gan-zhong-xue/gzx-append\.sh\s+(?:map|jsonl|pending))\s+<<'([A-Za-z_]\w*)'\s*$",
+                lines[i])
             if m:
-                delim = m.group(2)
+                delim = m.group(1)
                 j = i + 1
                 while j < len(lines) and lines[j].strip() != delim:
                     j += 1
                 if j < len(lines):
-                    # 围栏原文含定界符行后的那个换行——逐字喂（grok #2670 条件②：
-                    # 围栏原文直接喂 classify 必须绿，不许用切行方式丢掉末尾换行）
-                    save_cmds.append("\n".join(lines[i:j + 1]) + "\n")
+                    first_line = lines[i].replace("<SKILL_DIR>", _posix(SKILL_DIR))
+                    save_cmds.append("\n".join([first_line] + lines[i + 1:j + 1]) + "\n")
                 i = j
             i += 1
-    bad = [(c.splitlines()[0].strip()[:44], gdoc.classify(c).rule)
+    bad = [(c.splitlines()[0].strip()[:60], gdoc.classify(c).rule)
            for c in save_cmds if not gdoc.classify(c).allow]
     check("G3 正式保存 heredoc 原文逐字 classify 全 allow（抽到≥2 处）",
           len(save_cmds) >= 2 and not bad,

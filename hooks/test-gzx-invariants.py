@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""test-gzx-invariants.py — gan-zhong-xue v1.1.2 机械不变量测试（D7：机械必过面）。
+"""test-gzx-invariants.py — gan-zhong-xue v1.2.0 机械不变量测试（D7：机械必过面）。
 
 覆盖（全部在隔离临时 GZX_DIR 跑，绝不碰真实 ~/.gan-zhong-xue）：
   A. 写入器四态退出码（0/21/22/23）——bash 面 + python 核心双面（D2）
@@ -38,7 +38,9 @@ def _posix(p):
 
 
 def _find_git_bash():
-    """Windows 上 System32 的 bash 是 WSL（不认 /c/...）——优先找 Git Bash。"""
+    """Windows 上优先找 Git Bash（避开 WSL bash）；POSIX 上直接用系统 bash。"""
+    if os.name != "nt":
+        return shutil.which("bash")
     for cand in (r"C:\Program Files\Git\bin\bash.exe",
                  r"C:\Program Files\Git\usr\bin\bash.exe"):
         if os.path.exists(cand):
@@ -335,9 +337,17 @@ def test_commit_command_recognition():
         "PATH=$PATH:/x git commit -m y",                    # env 值含 $（$ 加进 wordchars）
         "FOO=$(date) git commit -m x",                      # env 值含命令替换
         "git -C C:/repo commit -m x",                       # 盘符冒号接回
+        # D3（docs/DEBT.md）：来源身份/引号形态成对正反断言
+        '"/usr/bin/git" commit -m x',
+        "/usr/bin/git commit -m x",
+        '"/tmp/my tools/git" commit -m x',                  # 带空格路径加引号：应识别
+        '"C:/Program Files/Git/bin/git.exe" commit -m x',   # 带空格 .exe 路径加引号：应识别
+        "PATH=/x git.exe commit -m x",
     ]
     # 不应识别（命令里出现 commit 字样，但不是在执行 git commit）
     no = [
+        "/tmp/my tools/git commit -m x",                    # D3 成对反例：带空格路径未加引号 → 拆词后程序名是 /tmp/my
+        "C:/Program Files/Git/bin/git.exe commit -m x",     # D3 成对反例：带空格 .exe 未加引号 → 程序名是 C:/Program
         "git status",
         "git log --oneline",
         "echo git commit",
@@ -575,15 +585,177 @@ def test_migration_no_rewrite():
     check("F1 真实数据目录未被本测试触碰（只读断言）", True)
 
 
+def test_tmp_cleanup_path_b():
+    """DEBT D1：无 flock(1) 时路径 B 不再使用 exec，退出前清理 $TMP，零残留。"""
+    if BASH_EXE is None:
+        print("SKIP D1 路径 B 临时文件清理（无可用 bash）")
+        return
+    d = tempfile.mkdtemp(prefix="gzx-d1-")
+    tmpd = tempfile.mkdtemp(prefix="gzx-d1tmp-")
+    minimal = tempfile.mkdtemp(prefix="gzx-d1path-")
+    try:
+        for tool in ("cat", "mktemp", "rm", "wc", "mkdir", "dirname", "uname", "python3"):
+            src = shutil.which(tool)
+            if src:
+                shutil.copy(src, os.path.join(minimal, tool))
+        env = dict(os.environ, GZX_DIR=_posix(d), TMPDIR=_posix(tmpd), PATH=minimal)
+        for idx in range(3):
+            r = subprocess.run([BASH_EXE, _posix(WRITER_SH), "pending"],
+                               env=env, input=("- item %d\n" % idx).encode(),
+                               capture_output=True, timeout=30)
+            if r.returncode != 0:
+                check("D1-1 无 flock 路径 B 写入成功", False,
+                      "rc=%d err=%s" % (r.returncode, r.stderr.decode(errors="replace")))
+                return
+        leftovers = [f for f in os.listdir(tmpd) if f.startswith("gzx-append.")]
+        check("D1-1 无 flock 路径 B 写入成功且临时目录零残留", len(leftovers) == 0,
+              "leftovers=%r" % leftovers)
+    finally:
+        _rmtree(d)
+        _rmtree(tmpd)
+        _rmtree(minimal)
+
+
+def test_cli_and_divergence():
+    """P0 + DEBT D2：gzx_cli.py preflight / save-cell 同锁双写 / check-divergence。"""
+    CLI = os.path.join(SKILL_DIR, "gzx_cli.py")
+    d = tempfile.mkdtemp(prefix="gzx-cli-")
+    try:
+        env = dict(os.environ, GZX_DIR=d)
+        r = subprocess.run([sys.executable, CLI, "preflight"], env=env,
+                           capture_output=True, timeout=30)
+        check("CLI-1 preflight 成功返回 JSON", r.returncode == 0)
+        pf = json.loads(r.stdout.decode("utf-8"))
+        check("CLI-1b preflight 自动引导写入器", pf.get("writer_ready") is True)
+
+        cell = json.dumps({
+            "概念": "数据与指令边界",
+            "分层": "🟡",
+            "来源": "🟢自",
+            "先猜": '用户说"只是配置文件"',
+            "证据": "揭示后意识到 eval 风险",
+            "顶点原理": "未隔离的数据边界等价于代码注入面",
+            "验证题": '把"数据即代码"迁到 SQL：为什么拼接字符串会出注入？',
+            "用户更懂": "无",
+            "状态": "待复验",
+            "备注": "包含英文引号与\n换行测试",
+        }, ensure_ascii=False)
+        r2 = subprocess.run([sys.executable, CLI, "save-cell"], env=env,
+                            input=cell.encode("utf-8"), capture_output=True, timeout=30)
+        check("CLI-2 save-cell 同锁双写成功", r2.returncode == 0,
+              r2.stderr.decode(errors="replace"))
+
+        r_div0 = subprocess.run([sys.executable, CLI, "check-divergence"], env=env,
+                                capture_output=True, timeout=30)
+        check("CLI-3 一致双地图 check-divergence 返回 0", r_div0.returncode == 0)
+
+        # 制造 D2 人为发散：单独向 map.md 再写一格
+        run_core(d, "map", "## 孤立格 · 🟡 · 2026-11-26\n- 状态：待复验\n\n")
+        r_div1 = subprocess.run([sys.executable, CLI, "check-divergence"], env=env,
+                                capture_output=True, timeout=30)
+        err_txt = r_div1.stderr.decode("utf-8", "replace")
+        check("CLI-4 D2 发散时 check-divergence 必报错并输出双侧计数",
+              r_div1.returncode != 0 and "md_count=2" in err_txt and "jsonl_count=1" in err_txt,
+              "rc=%d err=%s" % (r_div1.returncode, err_txt))
+    finally:
+        _rmtree(d)
+
+
+def test_capture_special_cases():
+    """P1：root-commit / detached HEAD / cd 与 -C 跨仓库上下文追踪。"""
+    d = tempfile.mkdtemp(prefix="gzx-capx-")
+    other = tempfile.mkdtemp(prefix="gzx-cap-other-")
+    repo = tempfile.mkdtemp(prefix="gzx-cap-target-")
+    try:
+        def git(*args):
+            return subprocess.run(["git", "-C", repo] + list(args),
+                                  capture_output=True, timeout=30)
+
+        git("init", "-b", "main")
+        git("config", "user.email", "t@example.invalid")
+        git("config", "user.name", "t")
+        with open(os.path.join(repo, "a.txt"), "w", encoding="utf-8") as f:
+            f.write("1\n")
+        git("add", "a.txt")
+        git("commit", "-m", "root")
+        h1 = git("rev-parse", "HEAD").stdout.decode().strip()
+        s1 = git("rev-parse", "--short", "HEAD").stdout.decode().strip()
+
+        env = dict(os.environ, GZX_DIR=d)
+        # 1) root-commit 标记 + cwd != 目标仓库（通过 cd 切换）
+        ev1 = json.dumps({
+            "tool_name": "Bash",
+            "tool_input": {"command": "cd %s && git commit -m root" % _posix(repo)},
+            "cwd": other,
+            "tool_response": {"output": "[main (root-commit) %s] root" % s1},
+        })
+        subprocess.run([sys.executable, CAPTURE], env=env, input=ev1.encode(),
+                       capture_output=True, timeout=30)
+
+        # 2) detached HEAD + git -C <repo>（cwd != 目标仓库）
+        git("checkout", "--detach", "HEAD")
+        with open(os.path.join(repo, "b.txt"), "w", encoding="utf-8") as f:
+            f.write("2\n")
+        git("add", "b.txt")
+        git("commit", "-m", "det")
+        h2 = git("rev-parse", "HEAD").stdout.decode().strip()
+        s2 = git("rev-parse", "--short", "HEAD").stdout.decode().strip()
+        ev2 = json.dumps({
+            "tool_name": "Bash",
+            "tool_input": {"command": "git -C %s commit -m det" % _posix(repo)},
+            "cwd": other,
+            "tool_response": {"output": "[detached HEAD %s] det" % s2},
+        })
+        subprocess.run([sys.executable, CAPTURE], env=env, input=ev2.encode(),
+                       capture_output=True, timeout=30)
+
+        cand = os.path.join(d, "candidates.jsonl")
+        shas = [json.loads(l)["sha"] for l in open(cand, encoding="utf-8") if l.strip()] \
+            if os.path.exists(cand) else []
+        check("CAP-X1 root-commit + cd 跨目录捕获成功", h1 in shas, repr(shas))
+        check("CAP-X2 detached HEAD + git -C 跨目录捕获成功", h2 in shas, repr(shas))
+    finally:
+        _rmtree(d)
+        _rmtree(other)
+        _rmtree(repo)
+
+
+def test_guard_scoping():
+    """P0：收窄守卫范围——同仓开发与文档编辑不误杀，数据目录仍严拦。"""
+    d = tempfile.mkdtemp(prefix="gzx-gscope-")
+    try:
+        env = dict(os.environ, GZX_DIR=d)
+        cases = [
+            ({"tool_name": "Bash", "tool_input": {"command": "cd /tmp/gan-zhong-xue && git status"}}, 0, "同仓 cd && git 不误杀"),
+            ({"tool_name": "Bash", "tool_input": {"command": 'git commit -m "fix gan-zhong-xue"'}}, 0, "commit message 提仓库名不误杀"),
+            ({"tool_name": "Write", "tool_input": {"file_path": "/tmp/gan-zhong-xue/README.md", "content": "~/.gan-zhong-xue"}}, 0, "写仓库文档提到数据目录不误杀"),
+            ({"tool_name": "Write", "tool_input": {"file_path": os.path.expanduser("~/.gan-zhong-xue/map.md"), "content": "x"}}, 2, "Write 直写数据目录仍拦"),
+            ({"tool_name": "Agent", "tool_input": {"prompt": "请冷读 gan-zhong-xue 仓库这次 diff"}}, 0, "Agent 提仓库名不误杀"),
+            ({"tool_name": "Agent", "tool_input": {"prompt": "去修改 ~/.gan-zhong-xue/map.md"}}, 2, "Agent 提数据目录仍拦"),
+        ]
+        for ev, want_rc, label in cases:
+            r = subprocess.run([sys.executable, GUARD], env=env,
+                               input=json.dumps(ev).encode(),
+                               capture_output=True, timeout=30)
+            check("GSCOPE " + label, r.returncode == want_rc,
+                  "got rc=%d want=%d stderr=%s" % (r.returncode, want_rc, r.stderr.decode(errors="replace")[:120]))
+    finally:
+        _rmtree(d)
+
+
 def main():
     check("P0 写入器与核心存在", os.path.exists(WRITER_SH) and os.path.exists(CORE_PY))
     test_core_states()
     test_writer_states()
     test_append_only()
+    test_tmp_cleanup_path_b()
+    test_cli_and_divergence()
     test_capture_dedup()
+    test_capture_special_cases()
     test_commit_command_recognition()
     test_capture_exception_silent_by_default()
     test_audit_no_raw_command()
+    test_guard_scoping()
     test_map_field_greppable()
     test_migration_no_rewrite()
     test_version_face()
