@@ -105,6 +105,9 @@ def _in_scope(text):
     for m in _protected_markers():
         if m in text or m.lower() in low:
             return True
+    # 臂③：basename 包含写入器或 CLI（即使正文不含数据目录字样也必须进入判定，防假写入器短路放行）
+    if re.search(r"\b(?:gzx-append(?:\.sh)?|gzx_cli(?:\.py)?)\b", text, re.I):
+        return True
     return False
 
 
@@ -140,8 +143,15 @@ def _is_writer_token(tok):
     base = _basename(tok)
     if base not in (WRITER_MARK, WRITER_MARK + ".sh"):
         return False
-    cand = os.path.expanduser(tok)
-    return _canon_path(shutil.which(cand) or cand) == _writer_installed_path()
+    # 如果带路径（相对或绝对路径），必须严格指向官方安装位
+    if "/" in tok or "\\" in tok:
+        cand = os.path.expanduser(tok)
+        return _canon_path(cand) == _writer_installed_path()
+    # 裸名直调（从 PATH 解析）：若 PATH 找到则必须指向官方安装位；若 PATH 未配则允许（shell 自身会 command not found，非越权写）
+    w = shutil.which(tok)
+    if w:
+        return _canon_path(w) == _writer_installed_path()
+    return True
 
 
 def _is_cli_token(tok):
@@ -234,6 +244,53 @@ _HEREDOC_CLI_RE = re.compile(
 )
 
 
+_REDIR_RE = re.compile(r"^(?:[0-9]+)?(>>|>&|&>>|&>|>\||<>|>)(.*)$")
+
+
+def _check_redirect(toks, i):
+    """统一的重定向检查与连续目标消费（修复 $ 劈裂与粘连算子）。
+    返回 (is_redir, decision_if_deny, next_i)。若非重定向，返回 (False, None, i)。"""
+    t = toks[i]
+    m = _REDIR_RE.match(t)
+    if not m:
+        return False, None, i
+    op = m.group(1)
+    tail = m.group(2)
+    next_i = i + 1
+    target_parts = []
+    if tail:
+        target_parts.append(tail)
+    else:
+        if next_i >= len(toks):
+            return True, Decision(False, "redirect:missing-target"), next_i
+        target_parts.append(toks[next_i])
+        next_i += 1
+
+    # 连续消费拼接目标：遇到分隔符、换行、管道或下一个重定向算子时停止
+    while next_i < len(toks):
+        nxt = toks[next_i]
+        if nxt in STRUCTURE_DENY_TOKENS or "\n" in nxt or nxt in PIPE_TOKENS or _REDIR_RE.match(nxt):
+            break
+        target_parts.append(nxt)
+        next_i += 1
+
+    full_target = "".join(target_parts)
+    # 数字目标（fd 复制，如 2>&1 或 1>&2）
+    if full_target.isdigit() and op in (">&", ">"):
+        return True, None, next_i
+
+    # 动态展开目标（包含 $、${、反引号等）
+    has_dynamic = any("$" in p or "`" in p or "{" in p for p in target_parts)
+    if has_dynamic:
+        if _is_protected(full_target) or _in_scope(full_target) or any(_is_protected(p) for p in target_parts):
+            return True, Decision(False, "redirect-to-protected:" + op), next_i
+
+    if _is_protected(full_target) or any(_is_protected(p) for p in target_parts):
+        return True, Decision(False, "redirect-to-protected:" + op), next_i
+
+    return True, None, next_i
+
+
 def _check_heredoc_first_line(cmd, delim, body, is_cli=False):
     lines = cmd.split("\n")
     if lines and lines[-1] == "":
@@ -251,13 +308,11 @@ def _check_heredoc_first_line(cmd, delim, body, is_cli=False):
         t = toks[i2]
         if t in STRUCTURE_DENY_TOKENS or "\n" in t:
             return Decision(False, "structure:" + t.replace("\n", "\\n")[:24])
-        if t in REDIRECT_TOKENS:
-            if i2 + 1 >= len(toks):
-                return Decision(False, "redirect:missing-target")
-            tgt = toks[i2 + 1]
-            if not tgt.isdigit() and _is_protected(tgt):
-                return Decision(False, "redirect-to-protected:" + t)
-            i2 += 2
+        is_redir, d_redir, next_i2 = _check_redirect(toks, i2)
+        if is_redir:
+            if d_redir:
+                return d_redir
+            i2 = next_i2
             continue
         i2 += 1
     if is_cli:
@@ -297,13 +352,11 @@ def classify(cmd):
             segments.append([])
             i += 1
             continue
-        if t in REDIRECT_TOKENS:
-            if i + 1 >= n:
-                return Decision(False, "redirect:missing-target")
-            tgt = toks[i + 1]
-            if not tgt.isdigit() and _is_protected(tgt):
-                return Decision(False, "redirect-to-protected:" + t)
-            i += 2
+        is_redir, d_redir, next_i = _check_redirect(toks, i)
+        if is_redir:
+            if d_redir:
+                return d_redir
+            i = next_i
             continue
         segments[-1].append(t)
         i += 1
@@ -484,6 +537,13 @@ def selftest():
          "heredoc:writer_identity"),
         ("python3 /tmp/evil/gzx_cli.py save-cell <<'E'\n~/.gan-zhong-xue/map.md\nE",
          "heredoc:cli_identity"),
+        # #128 A 组红线：臂③（正文不提数据目录的假写入器/假 CLI）+ $ 劈裂 + 大小写变体 + /c/ 路径
+        ("/tmp/evil/gzx-append.sh map <<'E'\nhello\nE", "heredoc:writer_identity"),
+        ("python3 /tmp/evil/gzx_cli.py save-cell <<'E'\nhello\nE", "heredoc:cli_identity"),
+        ("cat x > $HOME/.gan-zhong-xue/map.jsonl", "redirect-to-protected"),
+        ("cat x >$HOME/.gan-zhong-xue/map.jsonl", "redirect-to-protected"),
+        ("cat x > ~/.GAN-ZHONG-XUE/map.jsonl", "redirect-to-protected"),
+        ("cat x > /c/Users/foo/.gan-zhong-xue/map.jsonl", "redirect-to-protected"),
         ("~/.gan-zhong-xue/gzx-append.sh map <<'E'\nE\r\nrm ~/.gan-zhong-xue/map.md\nE",
          "heredoc:delim_repeats"),
         ("~/.gan-zhong-xue/gzx-append.sh map <<'E'\nE\r\r\nrm ~/.gan-zhong-xue/map.md\nE",

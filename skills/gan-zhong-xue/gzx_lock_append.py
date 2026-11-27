@@ -90,8 +90,9 @@ def lock_append(gzx_dir, target, data, prepend_if_missing=None):
 
 
 def lock_append_map_pair(gzx_dir, md_data, jsonl_data):
-    """同一把排他锁内同时追加 map.md 与 map.jsonl（D2 双地图防发散）。
-    先打开两个 'ab' 句柄再写入，避免权限/类型错误造成单边写入。"""
+    """同一把排他锁内依次追加 map.jsonl 与 map.md（D2 双地图互斥写入）。
+    锁提供单写者互斥防护，非跨文件事务原子；jsonl 包含全部元数据字段，
+    如遇写入中断导致发散，可据 jsonl 完好重建 md。"""
     if not md_data or not jsonl_data:
         return 21, "empty md or jsonl payload"
     md_bytes = _to_bytes(md_data)

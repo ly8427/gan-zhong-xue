@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import time
 
@@ -103,17 +104,37 @@ def _bootstrap_writer(gzx_dir):
     return copied
 
 
+def _parse_md_heading_concept(line):
+    if not line.startswith("## "):
+        return None
+    rest = line[3:].strip()
+    parts = [p.strip() for p in rest.split("·")]
+    return parts[0] if parts else None
+
+
 def _extract_md_section(md_path, concept):
+    """提取概念对应的 map.md 段落。
+    按概念名称精确匹配（防止短名如 'Foo' 误抢 'Foo Bar'），
+    并倒序查找最后一次出现的段落（与 jsonl 侧取最新行对齐）。"""
     lines = _read_lines(md_path)
-    prefix = "## %s" % concept
-    for i, ln in enumerate(lines):
-        if ln == prefix or ln.startswith(prefix + " ") or ln.startswith(prefix + "·"):
-            out = [ln]
-            for j in range(i + 1, len(lines)):
-                if lines[j].startswith("## "):
-                    break
-                out.append(lines[j])
-            return "\n".join(out).strip()
+    sections = []
+    curr = None
+    for ln in lines:
+        if ln.startswith("## "):
+            if curr is not None:
+                sections.append(curr)
+            curr = [ln]
+        elif curr is not None:
+            curr.append(ln)
+    if curr is not None:
+        sections.append(curr)
+
+    for sec in reversed(sections):
+        if not sec:
+            continue
+        c = _parse_md_heading_concept(sec[0])
+        if c == concept:
+            return "\n".join(sec).strip()
     return None
 
 
@@ -135,13 +156,32 @@ def _divergence_report(gzx_dir):
             rep["hint"] = "检测到遗留 md-only 格（map.jsonl 为空）；无需迁移，新格将同时写入两侧"
         else:
             rep["reason"] = "count-mismatch"
-            rep["hint"] = "map.md(%d 格) 与 map.jsonl(%d 行) 不一致；请以 map.jsonl 为准核对并重建对应 map.md 格" % (
+            rep["hint"] = "map.md(%d 格) 与 map.jsonl(%d 行) 不一致；map.jsonl 已包含全部字段(含证据/顶点原理/用户更懂)，可据其无损重建 map.md" % (
                 md_count, jsonl_total)
     return rep
 
 
+def _selftest_writer(gzx_dir):
+    """真实直执行写入器自检（badtarget 应回退出码 21 且带 unknown target）。"""
+    writer_sh = os.path.join(gzx_dir, "gzx-append.sh")
+    if not os.path.exists(writer_sh):
+        return False, "writer not found"
+    try:
+        if os.name == "nt":
+            bash_bin = shutil.which("bash") or r"C:\Program Files\Git\bin\bash.exe"
+            cmd = [bash_bin, writer_sh, "badtarget"]
+        else:
+            cmd = [writer_sh, "badtarget"]
+        r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+        ok = r.returncode == 21 and b"unknown target" in r.stderr
+        return ok, r.stderr.decode("utf-8", "replace").strip()
+    except Exception as e:
+        return False, str(e)
+
+
 def cmd_preflight(gzx_dir):
     copied = _bootstrap_writer(gzx_dir)
+    writer_ok, writer_diag = _selftest_writer(gzx_dir)
     pend_lines = [ln for ln in _read_lines(os.path.join(gzx_dir, "pending.md")) if ln.strip()]
     cand_rows, cand_bad, _ = _parse_jsonl(os.path.join(gzx_dir, "candidates.jsonl"))
     map_rows, map_bad, _ = _parse_jsonl(os.path.join(gzx_dir, "map.jsonl"))
@@ -179,7 +219,8 @@ def cmd_preflight(gzx_dir):
     out = {
         "gzx_dir": gzx_dir,
         "bootstrapped": copied,
-        "writer_ready": os.path.exists(os.path.join(gzx_dir, "gzx-append.sh")),
+        "writer_ready": writer_ok,
+        "writer_selftest": {"ok": writer_ok, "diag": writer_diag},
         "pending": {"count": len(pend_lines), "lines": pend_lines},
         "candidates": {
             "count": len(cand_rows),
@@ -271,10 +312,13 @@ def _validate_and_render_cell(obj):
             "分层": tier,
             "来源": source,
             "先猜": guess,
+            "证据": evidence,
+            "顶点原理": principle,
+            "验证题": q,
+            "用户更懂": user_knows,
             "首次": first,
             "上次复验": last_re,
             "状态": status,
-            "验证题": q,
             "备注": note,
         }
         md_lines = [

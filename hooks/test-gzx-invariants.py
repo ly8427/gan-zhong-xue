@@ -617,7 +617,7 @@ def test_tmp_cleanup_path_b():
 
 
 def test_cli_and_divergence():
-    """P0 + DEBT D2：gzx_cli.py preflight / save-cell 同锁双写 / check-divergence。"""
+    """P0 + DEBT D2 + Bugbot 1/2：gzx_cli.py preflight / cell 最新精确匹配 / save-cell 全字段 / check-divergence。"""
     CLI = os.path.join(SKILL_DIR, "gzx_cli.py")
     d = tempfile.mkdtemp(prefix="gzx-cli-")
     try:
@@ -626,7 +626,8 @@ def test_cli_and_divergence():
                            capture_output=True, timeout=30)
         check("CLI-1 preflight 成功返回 JSON", r.returncode == 0)
         pf = json.loads(r.stdout.decode("utf-8"))
-        check("CLI-1b preflight 自动引导写入器", pf.get("writer_ready") is True)
+        check("CLI-1b preflight 自动引导并直执行自检写入器", pf.get("writer_ready") is True
+              and pf.get("writer_selftest", {}).get("ok") is True)
 
         cell = json.dumps({
             "概念": "数据与指令边界",
@@ -642,8 +643,39 @@ def test_cli_and_divergence():
         }, ensure_ascii=False)
         r2 = subprocess.run([sys.executable, CLI, "save-cell"], env=env,
                             input=cell.encode("utf-8"), capture_output=True, timeout=30)
-        check("CLI-2 save-cell 同锁双写成功", r2.returncode == 0,
+        check("CLI-2 save-cell 成功", r2.returncode == 0,
               r2.stderr.decode(errors="replace"))
+
+        # Bugbot 2：验证 jsonl 行完整包含 证据/顶点原理/用户更懂（方案甲 SSOT）
+        with open(os.path.join(d, "map.jsonl"), "r", encoding="utf-8") as jf:
+            jrow = json.loads(jf.read().strip())
+        check("CLI-2b jsonl 行全字段包含证据/顶点原理/用户更懂",
+              jrow.get("证据") == "揭示后意识到 eval 风险"
+              and jrow.get("顶点原理") == "未隔离的数据边界等价于代码注入面"
+              and jrow.get("用户更懂") == "无")
+
+        # Bugbot 1：验证 cell 命令概念精确匹配（短名不抢长名）且取最新段落（倒序）
+        # 1. 写入长概念 "Foo Bar" 初始格
+        c_fb1 = json.dumps({"概念": "Foo Bar", "分层": "🟡", "来源": "🟢自", "先猜": "猜1", "证据": "证1", "顶点原理": "理1", "验证题": "题_FB1", "状态": "待复验"})
+        subprocess.run([sys.executable, CLI, "save-cell"], env=env, input=c_fb1.encode("utf-8"), capture_output=True, timeout=30)
+        # 2. 写入短概念 "Foo" 格（若前缀匹配会与 Foo Bar 冲突）
+        c_f = json.dumps({"概念": "Foo", "分层": "🟡", "来源": "🟢自", "先猜": "猜2", "证据": "证2", "顶点原理": "理2", "验证题": "题_FOO", "状态": "待复验"})
+        subprocess.run([sys.executable, CLI, "save-cell"], env=env, input=c_f.encode("utf-8"), capture_output=True, timeout=30)
+        # 3. 写入长概念 "Foo Bar" 复验追加新格（验证题变更为 题_FB2）
+        c_fb2 = json.dumps({"概念": "Foo Bar", "分层": "🟢自", "来源": "🟢自", "先猜": "猜3", "证据": "证3", "顶点原理": "理3", "验证题": "题_FB2", "状态": "已复验"})
+        subprocess.run([sys.executable, CLI, "save-cell"], env=env, input=c_fb2.encode("utf-8"), capture_output=True, timeout=30)
+
+        # 查短名 "Foo"：必须精确命中 Foo，不得抢占 Foo Bar，题面必须是 题_FOO
+        r_f = subprocess.run([sys.executable, CLI, "cell", "Foo"], env=env, capture_output=True, timeout=30)
+        out_f = json.loads(r_f.stdout.decode("utf-8"))
+        check("CLI-2c cell 短名精确匹配（短名不抢长名）",
+              "题_FOO" in (out_f.get("md_section") or "") and "Foo Bar" not in (out_f.get("md_section") or ""))
+
+        # 查长名 "Foo Bar"：必须取最后追加的最新格（题_FB2），而不是旧格（题_FB1）
+        r_fb = subprocess.run([sys.executable, CLI, "cell", "Foo Bar"], env=env, capture_output=True, timeout=30)
+        out_fb = json.loads(r_fb.stdout.decode("utf-8"))
+        check("CLI-2d cell 倒序提取最新追加段落（新行配新段）",
+              "题_FB2" in (out_fb.get("md_section") or "") and "题_FB1" not in (out_fb.get("md_section") or ""))
 
         r_div0 = subprocess.run([sys.executable, CLI, "check-divergence"], env=env,
                                 capture_output=True, timeout=30)
@@ -654,8 +686,8 @@ def test_cli_and_divergence():
         r_div1 = subprocess.run([sys.executable, CLI, "check-divergence"], env=env,
                                 capture_output=True, timeout=30)
         err_txt = r_div1.stderr.decode("utf-8", "replace")
-        check("CLI-4 D2 发散时 check-divergence 必报错并输出双侧计数",
-              r_div1.returncode != 0 and "md_count=2" in err_txt and "jsonl_count=1" in err_txt,
+        check("CLI-4 D2 发散时 check-divergence 必报错并输出双侧计数（退出码 24）",
+              r_div1.returncode == 24 and "md_count=5" in err_txt and "jsonl_count=4" in err_txt,
               "rc=%d err=%s" % (r_div1.returncode, err_txt))
     finally:
         _rmtree(d)
@@ -709,11 +741,62 @@ def test_capture_special_cases():
         subprocess.run([sys.executable, CAPTURE], env=env, input=ev2.encode(),
                        capture_output=True, timeout=30)
 
+        # 3) Bugbot 3：花括号分组 { cd repo; git commit; } 当前 shell 追踪
+        with open(os.path.join(repo, "c.txt"), "w", encoding="utf-8") as f:
+            f.write("3\n")
+        git("add", "c.txt")
+        git("commit", "-m", "brace")
+        h3 = git("rev-parse", "HEAD").stdout.decode().strip()
+        s3 = git("rev-parse", "--short", "HEAD").stdout.decode().strip()
+        ev3 = json.dumps({
+            "tool_name": "Bash",
+            "tool_input": {"command": "{ cd %s; git commit -m brace; }" % _posix(repo)},
+            "cwd": other,
+            "tool_response": {"output": "[detached HEAD %s] brace" % s3},
+        })
+        subprocess.run([sys.executable, CAPTURE], env=env, input=ev3.encode(),
+                       capture_output=True, timeout=30)
+
+        # 4) Bugbot 3：花括号后外溢 { cd repo; git status; }; git commit
+        with open(os.path.join(repo, "d.txt"), "w", encoding="utf-8") as f:
+            f.write("4\n")
+        git("add", "d.txt")
+        git("commit", "-m", "brace_after")
+        h4 = git("rev-parse", "HEAD").stdout.decode().strip()
+        s4 = git("rev-parse", "--short", "HEAD").stdout.decode().strip()
+        ev4 = json.dumps({
+            "tool_name": "Bash",
+            "tool_input": {"command": "{ cd %s; git status; }; git commit -m brace_after" % _posix(repo)},
+            "cwd": other,
+            "tool_response": {"output": "[detached HEAD %s] brace_after" % s4},
+        })
+        subprocess.run([sys.executable, CAPTURE], env=env, input=ev4.encode(),
+                       capture_output=True, timeout=30)
+
+        # 5) Bugbot 3：圆括号子 shell ( cd repo && git commit ) 内部捕获 + 外部不外溢
+        with open(os.path.join(repo, "e.txt"), "w", encoding="utf-8") as f:
+            f.write("5\n")
+        git("add", "e.txt")
+        git("commit", "-m", "subshell")
+        h5 = git("rev-parse", "HEAD").stdout.decode().strip()
+        s5 = git("rev-parse", "--short", "HEAD").stdout.decode().strip()
+        ev5 = json.dumps({
+            "tool_name": "Bash",
+            "tool_input": {"command": "( cd %s && git commit -m subshell )" % _posix(repo)},
+            "cwd": other,
+            "tool_response": {"output": "[detached HEAD %s] subshell" % s5},
+        })
+        subprocess.run([sys.executable, CAPTURE], env=env, input=ev5.encode(),
+                       capture_output=True, timeout=30)
+
         cand = os.path.join(d, "candidates.jsonl")
         shas = [json.loads(l)["sha"] for l in open(cand, encoding="utf-8") if l.strip()] \
             if os.path.exists(cand) else []
         check("CAP-X1 root-commit + cd 跨目录捕获成功", h1 in shas, repr(shas))
         check("CAP-X2 detached HEAD + git -C 跨目录捕获成功", h2 in shas, repr(shas))
+        check("CAP-X3 Bugbot3: 花括号分组内 cd 追踪捕获成功", h3 in shas, repr(shas))
+        check("CAP-X4 Bugbot3: 花括号分组后 cd 外溢顶层捕获成功", h4 in shas, repr(shas))
+        check("CAP-X5 Bugbot3: 圆括号子 shell 内 cd 捕获成功", h5 in shas, repr(shas))
     finally:
         _rmtree(d)
         _rmtree(other)
@@ -732,6 +815,13 @@ def test_guard_scoping():
             ({"tool_name": "Write", "tool_input": {"file_path": os.path.expanduser("~/.gan-zhong-xue/map.md"), "content": "x"}}, 2, "Write 直写数据目录仍拦"),
             ({"tool_name": "Agent", "tool_input": {"prompt": "请冷读 gan-zhong-xue 仓库这次 diff"}}, 0, "Agent 提仓库名不误杀"),
             ({"tool_name": "Agent", "tool_input": {"prompt": "去修改 ~/.gan-zhong-xue/map.md"}}, 2, "Agent 提数据目录仍拦"),
+            # #128 A 组红线：$ 劈裂、大小写变体、/c/ 路径、臂③假写入器
+            ({"tool_name": "Bash", "tool_input": {"command": "cat x > $HOME/.gan-zhong-xue/map.jsonl"}}, 2, "$HOME 重定向仍拦"),
+            ({"tool_name": "Bash", "tool_input": {"command": "cat x >$HOME/.gan-zhong-xue/map.jsonl"}}, 2, ">$HOME 粘连重定向仍拦"),
+            ({"tool_name": "Bash", "tool_input": {"command": "cat x > ~/.GAN-ZHONG-XUE/map.jsonl"}}, 2, "大小写变体重定向仍拦"),
+            ({"tool_name": "Bash", "tool_input": {"command": "cat x > /c/Users/foo/.gan-zhong-xue/map.jsonl"}}, 2, "/c/ 挂载点重定向仍拦"),
+            ({"tool_name": "Bash", "tool_input": {"command": "/tmp/evil/gzx-append.sh map <<'E'\nhello\nE"}}, 2, "臂③假写入器正文不含数据目录仍拦"),
+            ({"tool_name": "Bash", "tool_input": {"command": "python3 /tmp/evil/gzx_cli.py save-cell <<'E'\nhello\nE"}}, 2, "臂③假 CLI 正文不含数据目录仍拦"),
         ]
         for ev, want_rc, label in cases:
             r = subprocess.run([sys.executable, GUARD], env=env,

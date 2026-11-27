@@ -83,29 +83,30 @@ def _lex(cmd):
 
 
 def _iter_simple_commands_with_seps(cmd):
-    """产出 (depth, sep_before, seg)，用于在同层跟踪 cd 与子 shell 边界。"""
+    """产出 (subshell_depth, sep_before, seg)，用于跟踪 cd 与子 shell 边界。
+    注意：( ) 建立子 shell 隔离；{ } 是当前 shell 复合命令分组，不产生子 shell。"""
     tokens = _lex(cmd or "")
     if tokens is None:
         return
     seg = []
-    depth = 0
+    subshell_depth = 0
     sep_before = ""
     for tok in tokens:
         if tok in _REDIRECT_OPS:
             continue
         if tok in _CMD_SEPARATORS or tok in _SHELL_RESERVED:
             if seg:
-                yield depth, sep_before, seg
+                yield subshell_depth, sep_before, seg
                 seg = []
-            if tok in ("(", "{"):
-                depth += 1
-            elif tok in (")", "}"):
-                depth = max(0, depth - 1)
+            if tok == "(":
+                subshell_depth += 1
+            elif tok == ")":
+                subshell_depth = max(0, subshell_depth - 1)
             sep_before = tok
             continue
         seg.append(tok)
     if seg:
-        yield depth, sep_before, seg
+        yield subshell_depth, sep_before, seg
 
 
 def _iter_simple_commands(cmd):
@@ -193,14 +194,28 @@ def _resolve_dir(base, target):
 
 def _extract_git_contexts(cmd, initial_cwd):
     """追踪命令行中的 cd / env -C / git -C / --git-dir / --work-tree，
-    返回每个 git commit 命中的上下文列表 [(cwd, git_dir, work_tree), ...]。"""
+    返回每个 git commit 命中的上下文列表 [(cwd, git_dir, work_tree), ...]。
+    支持当前 shell 大括号分组 { cd repo; git commit; } 与子 shell 栈隔离 ( cd repo && git commit )。
+    已知残余漏报：变量目标 cd（目标含 $）与 cd - 暂不追踪，在 docs/mechanism.md 如实记录。"""
     cur_cwd = initial_cwd
     if cur_cwd and _normalize_dir is not None:
         cur_cwd = _normalize_dir(cur_cwd)
     contexts = []
+    cwd_stack = []
+    curr_depth = 0
     for depth, sep_before, seg in _iter_simple_commands_with_seps(cmd or ""):
-        # 仅在顶层且非管道子进程中追踪 cd（子 shell / 管道右侧的 cd 不影响外层）
-        if depth == 0 and sep_before not in ("|", "|&") and seg and seg[0] == "cd":
+        if depth > curr_depth:
+            for _ in range(depth - curr_depth):
+                cwd_stack.append(cur_cwd)
+            curr_depth = depth
+        elif depth < curr_depth:
+            for _ in range(curr_depth - depth):
+                if cwd_stack:
+                    cur_cwd = cwd_stack.pop()
+            curr_depth = depth
+
+        # 管道右侧的 cd 属于子进程不影响外层；其余（包括顶层、花括号分组、子 shell 内部）均更新当前上下文
+        if sep_before not in ("|", "|&") and seg and seg[0] == "cd":
             args = [a for a in seg[1:] if a != "--" and not a.startswith("-")]
             if args and args[0] != "-" and "$" not in args[0]:
                 cur_cwd = _resolve_dir(cur_cwd, args[0])
