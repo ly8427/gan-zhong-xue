@@ -822,6 +822,12 @@ def test_guard_scoping():
             ({"tool_name": "Bash", "tool_input": {"command": "cat x > /c/Users/foo/.gan-zhong-xue/map.jsonl"}}, 2, "/c/ 挂载点重定向仍拦"),
             ({"tool_name": "Bash", "tool_input": {"command": "/tmp/evil/gzx-append.sh map <<'E'\nhello\nE"}}, 2, "臂③假写入器正文不含数据目录仍拦"),
             ({"tool_name": "Bash", "tool_input": {"command": "python3 /tmp/evil/gzx_cli.py save-cell <<'E'\nhello\nE"}}, 2, "臂③假 CLI 正文不含数据目录仍拦"),
+            # Bugbot 新轮意见覆盖：插件源码文件编辑不误杀、Agent 提 CLI 不误杀、只读形态 2>&1 / 输入重定向放行、本地伪造写入器被拒
+            ({"tool_name": "Write", "tool_input": {"file_path": "skills/gan-zhong-xue/gzx_cli.py", "content": "# test"}}, 0, "Write 编辑插件 CLI 源码不误杀"),
+            ({"tool_name": "Agent", "tool_input": {"prompt": "请协助重构 gzx_cli.py 与 gzx-append.sh"}}, 0, "Agent 提 CLI/写入器名字不误杀"),
+            ({"tool_name": "Bash", "tool_input": {"command": "cat 2>&1 ~/.gan-zhong-xue/map.md"}}, 0, "只读 cat 2>&1 不误杀"),
+            ({"tool_name": "Bash", "tool_input": {"command": "cat > /tmp/out < ~/.gan-zhong-xue/map.md"}}, 0, "输入重定向读取数据目录不误杀"),
+            ({"tool_name": "Bash", "tool_input": {"command": "bash gzx-append.sh map < ~/.gan-zhong-xue/pending.md"}}, 2, "wrapper 执行本地伪写入器仍拦"),
         ]
         for ev, want_rc, label in cases:
             r = subprocess.run([sys.executable, GUARD], env=env,

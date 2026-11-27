@@ -105,13 +105,12 @@ def _in_scope(text):
     for m in _protected_markers():
         if m in text or m.lower() in low:
             return True
-    # 臂③：basename 包含写入器或 CLI（即使正文不含数据目录字样也必须进入判定，防假写入器短路放行）
-    if re.search(r"\b(?:gzx-append(?:\.sh)?|gzx_cli(?:\.py)?)\b", text, re.I):
-        return True
     return False
 
 
 def _is_protected(tok):
+    if not tok:
+        return False
     if _in_scope(tok):
         return True
     # 检查路径规范化后是否落入 GZX_DIR 之下
@@ -147,11 +146,11 @@ def _is_writer_token(tok):
     if "/" in tok or "\\" in tok:
         cand = os.path.expanduser(tok)
         return _canon_path(cand) == _writer_installed_path()
-    # 裸名直调（从 PATH 解析）：若 PATH 找到则必须指向官方安装位；若 PATH 未配则允许（shell 自身会 command not found，非越权写）
+    # 裸名直调（从 PATH 解析）：必须真实存在且指向官方安装位，未命中则拒绝
     w = shutil.which(tok)
     if w:
         return _canon_path(w) == _writer_installed_path()
-    return True
+    return False
 
 
 def _is_cli_token(tok):
@@ -178,7 +177,11 @@ def _seg_head_is_allowed(seg):
         return True
     if _is_cli_segment(seg):
         return True
-    if head in SHELL_WRAPPERS and any(_is_writer_token(t) for t in seg[1:]):
+    if head in SHELL_WRAPPERS and any(
+        _canon_path(t) == _writer_installed_path()
+        for t in seg[1:]
+        if ("/" in t or "\\" in t or t.startswith("~"))
+    ):
         return True
     return False
 
@@ -245,15 +248,20 @@ _HEREDOC_CLI_RE = re.compile(
 
 
 _REDIR_RE = re.compile(r"^(?:[0-9]+)?(>>|>&|&>>|&>|>\||<>|>)(.*)$")
+_ALL_REDIR_RE = re.compile(r"^(?:[0-9]+)?(<<<|<<|<|>>|>&|&>>|&>|>\||<>|>)(.*)$")
 
 
 def _check_redirect(toks, i):
-    """统一的重定向检查与连续目标消费（修复 $ 劈裂与粘连算子）。
+    """统一的重定向检查与目标消费（修复 $ 劈裂、输入重定向与只读穿透）。
     返回 (is_redir, decision_if_deny, next_i)。若非重定向，返回 (False, None, i)。"""
     t = toks[i]
     m = _REDIR_RE.match(t)
     if not m:
+        # 输入重定向（<, <<<）：只读行为，跳过其目标操作数，不当作输出写目标
+        if t in ("<", "<<<"):
+            return True, None, min(i + 2, len(toks))
         return False, None, i
+
     op = m.group(1)
     tail = m.group(2)
     next_i = i + 1
@@ -266,25 +274,28 @@ def _check_redirect(toks, i):
         target_parts.append(toks[next_i])
         next_i += 1
 
-    # 连续消费拼接目标：遇到分隔符、换行、管道或下一个重定向算子时停止
-    while next_i < len(toks):
-        nxt = toks[next_i]
-        if nxt in STRUCTURE_DENY_TOKENS or "\n" in nxt or nxt in PIPE_TOKENS or _REDIR_RE.match(nxt):
-            break
-        target_parts.append(nxt)
-        next_i += 1
-
-    full_target = "".join(target_parts)
-    # 数字目标（fd 复制，如 2>&1 或 1>&2）
-    if full_target.isdigit() and op in (">&", ">"):
+    # 数字目标（fd 复制，如 2>&1 或 1>&2），重定向自身已封闭，绝不向下多吞普通参数
+    if len(target_parts) == 1 and target_parts[0].isdigit() and op in (">&", ">"):
         return True, None, next_i
 
-    # 动态展开目标（包含 $、${、反引号等）
-    has_dynamic = any("$" in p or "`" in p or "{" in p for p in target_parts)
-    if has_dynamic:
-        if _is_protected(full_target) or _in_scope(full_target) or any(_is_protected(p) for p in target_parts):
-            return True, Decision(False, "redirect-to-protected:" + op), next_i
+    # 若目标含 $、{ 等动态展开语法，连续消费构成该字词的碎片标记直到词尾
+    if any("$" in p for p in target_parts):
+        while next_i < len(toks):
+            nxt = toks[next_i]
+            if nxt in STRUCTURE_DENY_TOKENS or "\n" in nxt or nxt in PIPE_TOKENS or _ALL_REDIR_RE.match(nxt):
+                break
+            prev = target_parts[-1]
+            if prev.endswith(("$", "{", "}", "/")) or nxt.startswith(("{", "}", "/")):
+                target_parts.append(nxt)
+                next_i += 1
+            elif not prev.startswith("$") and not prev.endswith(("$", "{", "}")):
+                break
+            else:
+                target_parts.append(nxt)
+                next_i += 1
+                break
 
+    full_target = "".join(target_parts)
     if _is_protected(full_target) or any(_is_protected(p) for p in target_parts):
         return True, Decision(False, "redirect-to-protected:" + op), next_i
 
@@ -326,9 +337,7 @@ def _check_heredoc_first_line(cmd, delim, body, is_cli=False):
 
 def classify(cmd):
     """对一条 Bash 命令做守卫判定。返回 Decision。纯函数，便于测试。"""
-    if not _in_scope(cmd):
-        return Decision(True, "out-of-scope")
-
+    # 臂③：writer / CLI heredoc 语法必须进入身份层检验（即使正文不含保护目录字样，假写入器也必拒）
     m = _HEREDOC_WRITER_RE.match(cmd)
     if m:
         return _check_heredoc_first_line(cmd, m.group(3), m.group(4), is_cli=False)
@@ -336,6 +345,9 @@ def classify(cmd):
     mc = _HEREDOC_CLI_RE.match(cmd)
     if mc:
         return _check_heredoc_first_line(cmd, mc.group(3), mc.group(4), is_cli=True)
+
+    if not _in_scope(cmd):
+        return Decision(True, "out-of-scope")
 
     toks, err = _structure_tokens(cmd)
     if err:
@@ -501,8 +513,16 @@ def selftest():
          "PENDING_EOF"),
         "~/.gan-zhong-xue/gzx-append.sh map <<'E'\n## 概念\nE\n",
         "~/.gan-zhong-xue/gzx-append.sh jsonl <<< '{\"id\":2}'",
+        # Bugbot 新增防护用例：只读形态含 2>&1 或输入重定向放行，同仓 git 命令放行
+        "cat 2>&1 ~/.gan-zhong-xue/map.md",
+        "cat > /tmp/out < ~/.gan-zhong-xue/map.md",
+        "git add skills/gan-zhong-xue/gzx_cli.py",
+        "git commit -m 'update gzx_cli.py'",
     ]
     denies = [
+        # Bugbot 新增防护用例：shell wrapper 运行本地目录伪造写入器触碰数据目录必拒
+        ("bash ./gzx-append.sh map < ~/.gan-zhong-xue/pending.md", "prefix:bash"),
+        ("bash gzx-append.sh map < ~/.gan-zhong-xue/pending.md", "prefix:bash"),
         ("cp /tmp/gzx-append ~/.gan-zhong-xue/map.md", "prefix:cp"),
         ("cp /tmp/evil ~/.gan-zhong-xue/gzx-append.sh", "prefix:cp"),
         ("cp a ~/.gan-zhong-xue/gzx-append.sh b", "prefix:cp"),
