@@ -9,6 +9,7 @@
   D. 守卫审计行不含命令原文（D1）+ 双向审计 + hook_alive 首行
   E. map.jsonl 新格字段齐全可数（先猜/验证题——D7 机械核验形状）+ 弃权串是合法值
   F. 真实数据目录只读断言（dsh #811③：迁移不重写，哈希进输出供 CHANGELOG 复核）
+  G. 发散明细截断如实（Bugbot 4727029068）：明细封顶后配对继续，孤立格数不失真
 
 运行：python hooks/test-gzx-invariants.py   （0 = 全过）
 """
@@ -739,6 +740,43 @@ def test_cli_and_divergence():
         _rmtree(d)
 
 
+def test_divergence_truncation():
+    """Bugbot 4727029068（Low）：字段不符明细到上限（10 条）时，旧码提前返回，并把
+    「已配对数」当成孤立格数写进 cell_check.orphan_md_cells。现：明细封顶后配对继续，
+    orphan_md_cells 才是真正的 md 孤立格数，并以 mismatches_truncated 如实标记明细被截断。"""
+    CLI = os.path.join(SKILL_DIR, "gzx_cli.py")
+    d = tempfile.mkdtemp(prefix="gzx-cli-trunc-")
+    try:
+        rows, md = [], []
+        for i in range(12):
+            rows.append(json.dumps({
+                "概念": "格%d" % i, "分层": "🟡", "来源": "🟢自", "先猜": "猜",
+                "证据": "jsonl值%d" % i, "顶点原理": "理", "验证题": "题",
+                "用户更懂": "无", "状态": "待复验", "备注": "",
+            }, ensure_ascii=False))
+            md.append("## 格%d · 🟡 · 2026-11-28\n- 证据：md值%d\n- 先猜：猜\n- 顶点原理：理\n"
+                      "- 底部验证题：题\n- 用户更懂：无\n- 状态：待复验\n" % (i, i))
+        md.append("## 孤立格 · 🟡 · 2026-11-28\n- 状态：待复验\n")   # md 独有 = 孤立格
+        run_core(d, "jsonl", "\n".join(rows) + "\n")
+        run_core(d, "map", "\n".join(md))
+        r = subprocess.run([sys.executable, CLI, "check-divergence"],
+                           env=dict(os.environ, GZX_DIR=d),
+                           capture_output=True, timeout=30)
+        try:
+            cc = (json.loads(r.stdout.decode("utf-8")) or {}).get("cell_check") or {}
+        except ValueError:
+            cc = {}
+        check("CLI-5a 明细到上限仍报发散（退出码 24）", r.returncode == 24,
+              "rc=%d" % r.returncode)
+        check("CLI-5b mismatches 恰为上限 10 条且 mismatches_truncated=true",
+              len(cc.get("mismatches") or []) == 10 and cc.get("mismatches_truncated") is True,
+              "n=%s truncated=%r" % (len(cc.get("mismatches") or []), cc.get("mismatches_truncated")))
+        check("CLI-5c 明细截断后 orphan_md_cells 仍是真正的孤立格数（1），不是已配对数",
+              cc.get("orphan_md_cells") == 1, "got %r" % (cc.get("orphan_md_cells"),))
+    finally:
+        _rmtree(d)
+
+
 def test_capture_special_cases():
     """P1：root-commit / detached HEAD / cd 与 -C 跨仓库上下文追踪。"""
     d = tempfile.mkdtemp(prefix="gzx-capx-")
@@ -941,6 +979,7 @@ def main():
     test_append_only()
     test_tmp_cleanup_path_b()
     test_cli_and_divergence()
+    test_divergence_truncation()
     test_capture_dedup()
     test_capture_special_cases()
     test_commit_command_recognition()

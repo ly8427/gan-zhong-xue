@@ -160,6 +160,8 @@ def _divergence_cell_check(map_rows, md_sections):
     checked = 0
     mismatches = []
     paired = 0
+    truncated = False        # 明细已到上限（Bugbot 4727029068：旧码在此处提前返回，
+                             # 把「已配对数」当成第三个返回值即孤立格数写进报告）
 
     rows_by = {}
     key_order = []
@@ -189,8 +191,11 @@ def _divergence_cell_check(map_rows, md_sections):
         rs = rows_by.get(k, [])
         ss = secs_by.get(k, [])
         if len(ss) < len(rs):
-            mismatches.append({"格": k[0], "分层": k[1],
-                               "问题": "md 缺 %d 个对应格" % (len(rs) - len(ss))})
+            if len(mismatches) >= 10:
+                truncated = True
+            else:
+                mismatches.append({"格": k[0], "分层": k[1],
+                                   "问题": "md 缺 %d 个对应格" % (len(rs) - len(ss))})
         for idx, row in enumerate(rs):
             if idx >= len(ss):
                 break
@@ -208,12 +213,13 @@ def _divergence_cell_check(map_rows, md_sections):
                         actual = ln[len(prefix):]
                         break
                 if actual is None or actual != str(row[key]):
-                    mismatches.append({"格": k[0], "分层": k[1], "字段": label,
-                                       "jsonl": str(row[key]), "md": actual})
                     if len(mismatches) >= 10:
-                        return checked, mismatches, paired
+                        truncated = True      # 明细封顶：只停止记录，配对继续——孤立格数才算得准
+                    else:
+                        mismatches.append({"格": k[0], "分层": k[1], "字段": label,
+                                           "jsonl": str(row[key]), "md": actual})
     orphan_md = max(0, len(md_sections) - paired)
-    return checked, mismatches, orphan_md
+    return checked, mismatches, orphan_md, truncated
 
 
 def _divergence_report(gzx_dir):
@@ -235,7 +241,7 @@ def _divergence_report(gzx_dir):
     if curr is not None:
         sections.append(curr)
 
-    checked, mismatches, orphan_md = _divergence_cell_check(map_rows, sections)
+    checked, mismatches, orphan_md, truncated = _divergence_cell_check(map_rows, sections)
     count_diverged = md_count != jsonl_total
     diverged = count_diverged or bool(mismatches) or orphan_md > 0
     rep = {
@@ -246,6 +252,7 @@ def _divergence_report(gzx_dir):
         "cell_check": {
             "checked": checked,
             "mismatches": mismatches,
+            "mismatches_truncated": truncated,
             "orphan_md_cells": orphan_md,
         },
     }
