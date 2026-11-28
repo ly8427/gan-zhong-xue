@@ -5,13 +5,17 @@
 定位：减速带 + 审计，不是安全边界。真不变量在写入器 gzx-append.sh / gzx_cli.py。
 v1.2.0 收窄范围判据：不再以泛化的 "gan-zhong-xue" 字样触发拦截（避免误杀同仓开发、
 文档编辑及 Agent 提示词），改为精确指向运行时数据目录（.gan-zhong-xue / GZX_DIR）。
+
+判定流（board #129 收敛，2026-11-28 守卫重写）——只问两个能可靠回答的问题：
+  ① 这条命令的命令名是不是「会启动程序的类型」（启动器封闭清单，_is_launcher_cmd）；
+  ② 命令里任何位置有没有出现官方写入器 / CLI 的名字（_name_hit）。
+两个都是 ⇒ 每个出现处的完整路径必须精确等于官方固定位（_identity_ok），否则拒。
+不分析「谁执行谁」（launcher 任意嵌套，位置分析无界），不维护解释器选项表。
 """
 
 import json
 import os
 import re
-import shlex
-import shutil
 import subprocess
 import sys
 import time
@@ -39,11 +43,46 @@ FIND_DENY_FLAGS = {
     "-exec", "-execdir", "-ok", "-okdir", "-delete",
     "-fprint", "-fprint0", "-fprintf", "-fls",
 }
-STRUCTURE_DENY_TOKENS = {";", "&&", "||", "&", "$(", "`", "<(", ">(", "\n"}
-REDIRECT_TOKENS = {">", ">>", ">|", ">&", "&>", "&>>", "<>"}
-PIPE_TOKENS = {"|", "|&"}
-SHELL_WRAPPERS = {"bash", "sh", "source", "."}
-PYTHON_BINS = {"python", "python3"}
+
+# ── 词法底座（一遍扫出「词」与「操作符」，各自带原文起止位置）──
+# 守卫所需的 bash 词法子集：
+#   * 未加引号的空白分隔词；词首未加引号的 # 到行尾是注释；
+#   * '…' 字面；"…" 里反斜杠只转义 $ ` " \ 与换行；词外反斜杠转义下一个字符；
+#   * $(…) 与反引号是词的一部分：按原字符留在词文本里（守卫不展开，只判「含扩展算子」），
+#     其内部的空白与 ; | & < > ( ) 不切词；
+#   * 词外的换行 ; | & < > ( ) 是操作符。
+# 词文本 = 引号剥除、转义已解之后的 shell 词；quoted = 该词含引号部分。
+_WS = " \t\r"
+_CTRL = "\n;|&<>()"
+_OPS = sorted([
+    ";;&", ";;", ";&", ";", "|&", "||", "|", "&>>", "&>", "&&", "&", "\n",
+    "<<-", "<<<", "<<", "<>", "<&", "<(", "<", ">>", ">&", ">|", ">(", ">",
+    "(", ")",
+], key=len, reverse=True)
+_SEP_OPS = {"\n", ";", ";;", ";;&", ";&", "&&", "&", "|", "||", "|&",
+            "(", ")", "<(", ">("}                    # 命令块边界
+_STRUCT_OPS = _SEP_OPS - {"|", "|&"}                # 范围内一律拒；管道只切块
+_OUT_OPS = {">", ">>", ">|", "&>", "&>>", "<>"}      # 写文件的重定向
+_IN_OPS = {"<", "<<", "<<-", "<<<"}                   # 读 / heredoc / herestring（不查目标）
+_EXPANSION_CHARS = "*?[]{}$`"
+
+# ── 启动器封闭清单（board #129 重写计划 v2；清单外 = 已声明边界，见 README）──
+_SHELL_FAMILY = {"bash", "sh", "zsh", "dash", "ksh", "source", "."}
+_INTERP_FAMILY = {"python", "python3", "perl", "ruby", "node"}
+_PY_VERSIONED_RE = re.compile(r"^python\d+(\.\d+)*$")   # python3.12 / python2 一类同名解释器
+_LAUNCHER_FAMILY = {
+    "env", "nice", "nohup", "setsid", "stdbuf", "timeout", "sudo", "su", "doas",
+    "xargs", "command", "exec", "builtin", "time", "script", "watch", "busybox",
+    "strace", "ltrace", "chroot", "pkexec",
+}
+# 会把「脚本文件参数」当程序执行的命令（命令名在该段的词之后，参数必须字面）
+_SCRIPT_RUNNERS = _SHELL_FAMILY | _INTERP_FAMILY
+_WRITER_BASENAMES = (WRITER_MARK, WRITER_MARK + ".sh")
+_NAME_BASENAMES = set(_WRITER_BASENAMES) | {CLI_FILENAME}
+_NAME_ORDER = (WRITER_MARK + ".sh", WRITER_MARK, CLI_FILENAME)   # 长名在前
+_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_PATH_ASSIGN_RE = re.compile(r"^PATH=", re.IGNORECASE)
+_SUBST_RE = re.compile(r"\$\(|\)|`")            # 命令替换的边界字符
 
 
 class Decision:
@@ -52,20 +91,144 @@ class Decision:
         self.rule = rule
 
 
+class _Tok(object):
+    """词法项。kind='w' 词（引号已剥、转义已解）或 kind='o' 操作符；
+    start/end 是原文下标；quoted=该词含引号部分；subst=含活的命令替换
+    （$(…) / 反引号，且不在单引号里）。"""
+    __slots__ = ("kind", "text", "start", "end", "quoted", "subst")
+
+    def __init__(self, kind, text, start, end, quoted=False, subst=False):
+        self.kind = kind
+        self.text = text
+        self.start = start
+        self.end = end
+        self.quoted = quoted
+        self.subst = subst
+
+    def __repr__(self):
+        return "%s%r" % (self.kind, self.text)
+
+
+def _lex(s):
+    """Bash 词法（守卫所需子集）。返回 (items, None) 或 (None, "unparseable")。
+    引号未闭合 / 末尾悬挂反斜杠 / $( 或反引号未闭合 ⇒ unparseable（调用方默认拒）。"""
+    items = []
+    i, n = 0, len(s)
+    while i < n:
+        c = s[i]
+        if c in _WS:
+            i += 1
+            continue
+        if c == "#":                     # 只在词首到达这里：注释到行尾
+            j = s.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if c in _CTRL:
+            op = s[i]
+            for cand in _OPS:
+                if s.startswith(cand, i):
+                    op = cand
+                    break
+            items.append(_Tok("o", op, i, i + len(op)))
+            i += len(op)
+            continue
+        start = i
+        buf = []
+        quoted = False
+        subst = False
+        q = None            # 当前引号：None / "'" / '"'
+        depth = 0           # 未闭合的 $( 与其内 ( 的层数
+        ticks = 0           # 是否在反引号内
+        while i < n:
+            c = s[i]
+            nxt = s[i + 1] if i + 1 < n else ""
+            if q == "'":
+                if c == "'":
+                    q = None
+                else:
+                    buf.append(c)
+                i += 1
+            elif c == "\\":
+                if nxt == "\n":                      # 续行
+                    i += 2
+                elif q == '"':
+                    if nxt and nxt in '$`"\\':       # 双引号内只有这五个字符可被转义
+                        buf.append(nxt)
+                        i += 2
+                    else:
+                        buf.append("\\")
+                        i += 1
+                elif nxt:
+                    buf.append(nxt)
+                    i += 2
+                else:
+                    return None, "unparseable"
+            elif c == "'" and q is None:
+                q = "'"
+                quoted = True
+                i += 1
+            elif c == '"':
+                if q == '"':
+                    q = None
+                else:
+                    q = '"'
+                    quoted = True
+                i += 1
+            elif c == "`":
+                buf.append(c)
+                ticks ^= 1
+                subst = True
+                i += 1
+            elif c == "$" and nxt == "(":
+                subst = True
+                if s.startswith("$((", i):
+                    buf.append("$((")
+                    depth += 2
+                    i += 3
+                else:
+                    buf.append("$(")
+                    depth += 1
+                    i += 2
+            elif depth > 0 or ticks:
+                if not ticks:
+                    if c == "(":
+                        depth += 1
+                    elif c == ")":
+                        depth -= 1
+                buf.append(c)
+                i += 1
+            elif q == '"':
+                buf.append(c)
+                i += 1
+            elif c in _WS or c == "\n" or c in _CTRL:
+                break
+            else:
+                buf.append(c)
+                i += 1
+        if i >= n and (q is not None or depth or ticks):
+            return None, "unparseable"
+        items.append(_Tok("w", "".join(buf), start, i, quoted, subst))
+    return items, None
+
+
 def _basename(tok):
     return tok.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
 
 
-def _structure_tokens(cmd):
-    """结构层分词。返回 (tokens, None) 或 (None, 错误信息)。"""
-    lex = shlex.shlex(cmd, posix=True, punctuation_chars="();<>|&`$\n")
-    lex.whitespace_split = False
-    lex.whitespace = " \t\r"
-    lex.commenters = ""
-    try:
-        return list(lex), None
-    except ValueError:
-        return None, "unparseable"
+def _cmd_name(text):
+    """命令名（比较用）：basename、小写、去 .exe（Windows 的 bash.exe / python.exe）。"""
+    b = _basename(text).lower()
+    if b.endswith(".exe") and len(b) > 4:
+        b = b[:-4]
+    return b
+
+
+def _has_expansion(s):
+    return any(c in _EXPANSION_CHARS for c in s)
+
+
+def _has_ws(s):
+    return any(c in " \t\r\n" for c in s)
 
 
 def _canon_path(p):
@@ -138,117 +301,230 @@ def _cli_official_path():
     return _canon_path(os.path.join(_plugin_skill_dir(), CLI_FILENAME))
 
 
-def _is_writer_token(tok):
-    base = _basename(tok)
-    if base not in (WRITER_MARK, WRITER_MARK + ".sh"):
+def _resolve_bare(name):
+    """裸**命令名**按 PATH 顺序解析（实测：bash 对命令名只搜 PATH，不看当前目录）。
+    返回 (命中文件, 命中前是否遇到过「当前目录项」)；找不到返回 (None, …)。
+    空项与 . 都表示「当前目录」——守卫看不到工具的当前目录，排在前面的这类项使解析不可证。
+    Windows 的 shutil.which 只认 PATHEXT 后缀（.sh 不在内）而 Git Bash 按 shebang 判可执行，
+    故不借用 which，自己扫：存在且（POSIX 上）可执行即命中。"""
+    dot_before = False
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        if d.strip() in ("", ".", "./"):
+            dot_before = True
+            continue
+        cand = os.path.join(d, name)
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand, dot_before
+    return None, dot_before
+
+
+def _identity_ok(path, name, provable=True):
+    """path 是否精确等于官方名 name 的固定位。
+    赋值前缀（W=…）先剥掉；带分隔符 / 带空白的路径按规范化路径精确相等；
+    裸写入器名只可能是**命令名**（参数位上的裸名在调用处已一律拒，见 _gates），
+    按 PATH 解析到官方位才算数，provable=False（命令自带 PATH= 前缀）时不可证；
+    裸 CLI 名按当前目录解析（python 打开脚本就是相对当前目录）。"""
+    m = _ENV_ASSIGN_RE.match(path)
+    if m:
+        path = path[m.end():]
+    if not path:
         return False
-    # 如果带路径（相对或绝对路径），必须严格指向官方安装位
-    if "/" in tok or "\\" in tok:
-        cand = os.path.expanduser(tok)
-        return _canon_path(cand) == _writer_installed_path()
-    # 裸名直调（从 PATH 解析）：必须真实存在且指向官方安装位，未命中则拒绝
-    w = shutil.which(tok)
-    if w:
-        return _canon_path(w) == _writer_installed_path()
-    return False
-
-
-def _is_cli_token(tok):
-    if _basename(tok) != CLI_FILENAME:
-        return False
-    cand = os.path.expanduser(tok)
-    return _canon_path(cand) == _cli_official_path()
-
-
-def _is_cli_segment(seg):
-    if len(seg) < 2:
-        return False
-    head = _basename(seg[0]).lower()
-    if head.endswith(".exe"):
-        head = head[:-4]
-    return head in PYTHON_BINS and _is_cli_token(seg[1])
-
-
-def _seg_head_is_allowed(seg):
-    head = _basename(seg[0])
-    if head in READONLY_PREFIX:
-        return True
-    if _is_writer_token(seg[0]):
-        return True
-    if _is_cli_segment(seg):
-        return True
-    if head in SHELL_WRAPPERS:
-        # 包装器（bash/sh/source/.）参数扩展检查（dsh #3055 §3 / grok #3054 High /
-        # pi #3058 §B-2）：参数里出现写入器名（裸名或带路径）必须能解析到官方安装位，
-        # 解析不到（which 未命中 / 指向别处）一律拒——fail-closed，不许用
-        # 「查不到即放行」换绿灯。裸名在装了官方写入器（PATH 可达）的机器上解析
-        # 成功 ⇒ 放行（合法直调），所以裸名 allow 用例按安装态条件生效。
-        ok = False
-        for t in seg[1:]:
-            b = _basename(t)
-            if b in _WRITER_BASENAMES and not _is_writer_token(t):
-                return False
-            if _is_writer_token(t):
-                ok = True
-            elif ("/" in t or "\\" in t or t.startswith("~")) and \
-                    _canon_path(t) == _writer_installed_path():
-                ok = True
-        return ok
-    return False
-
-
-_BOOTSTRAP_SRC_NAMES = {"gzx-append.sh", "gzx_lock_append.py"}
-_BOOTSTRAP_SETUP = {"mkdir", "chmod"}
-
-
-def _seg_is_bootstrap(seg):
-    head = _basename(seg[0])
-    cur_dir = GZX_DIR
-    if head in ("cp", "install"):
-        if len(seg) != 3:
+    official = _cli_official_path() if name == CLI_FILENAME else _writer_installed_path()
+    if name != CLI_FILENAME and not any(c in path for c in "/\\ \t"):
+        if not provable:
             return False
-        src_path = os.path.expanduser(seg[1])
-        src = _basename(src_path)
-        dst_path = os.path.expanduser(seg[2])
-        dst = _basename(dst_path)
-        dst_dir = os.path.dirname(dst_path)
-        if (src not in _BOOTSTRAP_SRC_NAMES
-                or dst not in _BOOTSTRAP_SRC_NAMES
-                or _canon_path(dst_dir) != _canon_path(cur_dir)):
-            return False
-        return _canon_path(src_path) == _canon_path(
-            os.path.join(_plugin_skill_dir(), src))
-    if head in _BOOTSTRAP_SETUP:
-        args = [t for t in seg[1:] if not (t.isdigit() and len(t) == 1)]
-        pathish = [t for t in args if ("/" in t or "\\" in t or t.startswith("~"))]
-        if head == "mkdir":
-            targets = [t for t in args if not t.startswith("-")]
-            return (bool(targets)
-                    and all(_canon_path(t) == _canon_path(cur_dir) for t in targets))
-        modeparts = [t for t in args if t not in pathish]
-        if len(pathish) != 1 or not modeparts:
-            return False
-        mode = "".join(modeparts)
-        if mode.startswith("-"):
-            return False
-        target = pathish[0]
-        if _canon_path(target) == _writer_installed_path():
-            return "+" in mode and "x" in mode
-        if _canon_path(target) == _canon_path(cur_dir):
-            return mode == "700"
-        return False
-    return False
+        w, dot_before = _resolve_bare(path)
+        return bool(w) and not dot_before and _canon_path(w) == official
+    return _canon_path(path) == official
 
 
-# writer-heredoc 例外（支持无引号与引号包裹的写入器路径）
+def _name_hit(text):
+    """词里的官方名出现处。返回 None / ("path", 路径文本, 名字) / ("payload", 名字)。
+    整词以官方名结尾（basename 相等）⇒ 这个词是一个路径，交 _identity_ok 核固定位
+    （dsh #3072 §1-4 (i)：可分词对象用 basename 相等；装在带空格目录下的官方件也走这里）。
+    否则若词里带空白（必来自引号）⇒ 它是「带引号的程序串」（bash -c / su -c / watch 的
+    命令串、herestring）：后半段守卫无法审计，串里出现官方名**子串**即 payload
+    （dsh #3072 §1-4 (ii)：边界不可恢复的对象用子串、仅 deny——串内的引号与标点
+    会让 basename 不再干净，如 bash -c "python3 '/x/gzx_cli.py' save-cell"）。"""
+    base = _basename(text).lower()
+    if base not in _NAME_BASENAMES:
+        # 带空格的路径（装在带空格目录下的官方件）：官方名是最后一个空白段
+        stripped = text.rstrip()
+        base = _basename(stripped.rsplit(None, 1)[-1]).lower() if stripped else ""
+        if base not in _NAME_BASENAMES:
+            if not _has_ws(text):
+                return None
+            name = _name_substring(text)
+            return ("payload", text, name) if name else None
+    return ("path", text, base)
+
+
+def _name_substring(text):
+    low = text.lower()
+    return next((n for n in _NAME_ORDER if n in low), None)
+
+
+def _is_script_runner(name):
+    return name in _SCRIPT_RUNNERS or _PY_VERSIONED_RE.match(name) is not None
+
+
+def _is_py_name(name):
+    return name in ("python", "python3") or _PY_VERSIONED_RE.match(name) is not None
+
+
+def _is_launcher_cmd(name):
+    """问题①：命令名是不是「会启动程序的类型」= 启动器封闭清单 ∪ 官方名字集合。"""
+    return (_is_script_runner(name) or name in _LAUNCHER_FAMILY
+            or name in _NAME_BASENAMES)
+
+
+def _has_path_assign(words):
+    """命令里是否有 PATH=… 赋值词（含 env 的 PATH=… 参数）。"""
+    return any(_PATH_ASSIGN_RE.match(t.text) for t in words)
+
+
+def _parse_redirects(block):
+    """块内重定向：返回 ([(操作符项, 操作符, 目标词文本或 None)], 被重定向吃掉的词下标集)。
+    被吃掉的词 = io 号、操作符、操作数——它们不再参与命令名 / 参数判定。"""
+    redirs = []
+    consumed = set()
+    i, n = 0, len(block)
+    while i < n:
+        t = block[i]
+        if t.kind == "o" and (t.text in _OUT_OPS or t.text in _IN_OPS
+                              or t.text in (">&", "<&")):
+            if (i > 0 and block[i - 1].kind == "w" and block[i - 1].text.isdigit()
+                    and block[i - 1].end == t.start):
+                consumed.add(i - 1)                  # 紧贴操作符的纯数字 = io 号
+            consumed.add(i)
+            tgt = None
+            if i + 1 < n and block[i + 1].kind == "w":
+                tgt = block[i + 1].text
+                consumed.add(i + 1)
+            redirs.append((t, t.text, tgt))
+            i += 2 if tgt is not None else 1
+            continue
+        i += 1
+    return redirs, consumed
+
+
+def _is_file_output(op, target):
+    """写文件的重定向？fd 复制（2>&1、2>&-）与输入重定向不算。"""
+    if op in (">&", "<&"):
+        return op == ">&" and not (target is None or target.isdigit() or target == "-")
+    return op in _OUT_OPS
+
+
+def _output_targets(redirs):
+    return [(op, tgt) for _t, op, tgt in redirs if _is_file_output(op, tgt)]
+
+
+def _parse_chunks(toks):
+    """按命令块边界（; & | 换行 括号 进程替换）切块，并逐块解析。"""
+    blocks = [[]]
+    for t in toks:
+        if t.kind == "o" and t.text in _SEP_OPS:
+            blocks.append([])
+        else:
+            blocks[-1].append(t)
+    cmds = []
+    for block in blocks:
+        redirs, consumed = _parse_redirects(block)
+        words = [t for k, t in enumerate(block) if t.kind == "w" and k not in consumed]
+        assign_only = bool(words) and all(_ENV_ASSIGN_RE.match(t.text) for t in words)
+        head = None
+        for t in words:
+            if not _ENV_ASSIGN_RE.match(t.text):
+                head = t
+                break
+        if head is None and words:
+            head = words[0]       # 纯赋值块取首词（基线行为保持：赋值行里的官方名/数据目录仍进范围）
+        cmds.append({"toks": block, "words": words, "redirs": redirs,
+                     "assign_only": assign_only, "head": head})
+    return cmds
+
+
+def _structure_rule(op):
+    return "structure:" + ("\\n" if op == "\n" else op)
+
+
+def _gates(cmds):
+    """与范围无关的三道闸（进出范围两向都拦）。返回 (deny Decision 或 None, 核实过官方名的块下标集)。
+    闸一：写文件的重定向目标必须字面（落盘路径由 shell 产生即不可静态证明）。
+    闸二：命令名必须完全字面；命令名带空白（引号粘合，词边界不可恢复）且含官方名 ⇒ 拒。
+    闸三：命令名是启动器类型 ⇒ 块内**任何位置**的官方名都必须在固定位；
+          名字出现在带引号的程序串里（-c 载荷等）⇒ 拒；脚本执行型命令（shell / 解释器）
+          的其余参数必须字面（带空白的引号串除外——那是程序文本 / 自由文本，不是脚本路径）。"""
+    official = set()
+    for ci, c in enumerate(cmds):
+        for _op, tgt in _output_targets(c["redirs"]):
+            if tgt is not None and _has_expansion(tgt):
+                return Decision(False, "expansion:unprovable"), official
+        head = c["head"]
+        if head is None:
+            continue
+        if not c["assign_only"]:
+            # [ 与 { 是 test 内建 / 花括号组保留字：自身含的括号字符不是扩展算子
+            if head.text not in ("[", "[[", "{") and _has_expansion(head.text):
+                return Decision(False, "expansion:unprovable"), official
+            if _has_ws(head.text):
+                hit = _name_hit(head.text)
+                if hit is not None and hit[0] == "payload":
+                    return Decision(False, "expansion:unprovable"), official
+                if hit is not None and not _identity_ok(hit[1], hit[2]):
+                    return Decision(False, "identity:" + hit[2]), official
+        if c["assign_only"]:
+            if _basename(head.text).lower() not in _NAME_BASENAMES:
+                continue
+        elif not _is_launcher_cmd(_cmd_name(head.text)):
+            continue
+        for t in c["toks"]:
+            if t.kind != "w":
+                continue
+            if t.subst:
+                # 命令替换里的名字（bash $(echo /x/gzx-append.sh)）：整词不可能等于固定位
+                name = _name_substring(_SUBST_RE.sub(" ", t.text))
+                if name:
+                    return Decision(False, "identity:" + name), official
+                continue
+            hit = _name_hit(t.text)
+            if hit is None:
+                continue
+            if hit[0] == "payload":
+                return Decision(False, "payload:" + hit[2]), official
+            bare_writer = (hit[2] != CLI_FILENAME
+                           and not any(c in hit[1] for c in "/\\ \t"))
+            if bare_writer and (t is not head or _has_path_assign(c["words"])):
+                # 裸写入器名只在命令名位可信。参数位上一律拒——实测 bash/sh 找脚本参数
+                # 时**先看当前目录再看 PATH**（python 则只看当前目录），当前目录里的同名
+                # 假件会遮住 PATH 上的官方件；命令自带 PATH= 前缀时守卫也看不到那个 PATH。
+                return Decision(False, "identity:" + hit[2]), official
+            if not _identity_ok(hit[1], hit[2]):
+                return Decision(False, "identity:" + hit[2]), official
+            official.add(ci)
+        if c["assign_only"] or not _is_script_runner(_cmd_name(head.text)):
+            continue
+        seen = False
+        for t in c["words"]:
+            if t is head:
+                seen = True
+                continue
+            if not seen:
+                continue
+            # 活的命令替换一律不可证；其余带空白的引号串是程序文本 / 自由文本，不是脚本路径
+            if t.subst or (_has_expansion(t.text) and not (t.quoted and _has_ws(t.text))):
+                return Decision(False, "expansion:unprovable"), official
+    return None, official
+
+
+# ── heredoc ──
+# 官方 writer / CLI heredoc 例外（支持无引号与引号包裹的路径）：命中即进身份层。
 _HEREDOC_WRITER_RE = re.compile(
     r"^[ \t]*(?:'[^'\n]*gzx-append\.sh'|\"[^\"\n]*gzx-append\.sh\"|\S*gzx-append\.sh)"
     r"[ \t]+(map|jsonl|pending|candidates|audit)"
     r"[ \t]+<<[ \t]*(['\"])([A-Za-z_][A-Za-z0-9_]*)\2\n((?:.*\n)?)\3$",
     re.DOTALL,
 )
-
-# 官方 CLI heredoc 例外（save-cell / pending-add）
 _HEREDOC_CLI_RE = re.compile(
     r"^[ \t]*(?:'[^'\n]*python3?(?:\.exe)?'|\"[^\"\n]*python3?(?:\.exe)?\"|\S*python3?(?:\.exe)?)[ \t]+"
     r"(?:'[^'\n]*gzx_cli\.py'|\"[^\"\n]*gzx_cli\.py\"|\S*gzx_cli\.py)"
@@ -256,161 +532,6 @@ _HEREDOC_CLI_RE = re.compile(
     r"[ \t]+<<[ \t]*(['\"])([A-Za-z_][A-Za-z0-9_]*)\2\n((?:.*\n)?)\3$",
     re.DOTALL,
 )
-
-
-_REDIR_RE = re.compile(r"^(?:[0-9]+)?(>>|>&|&>>|&>|>\||<>|>)(.*)$")
-_ALL_REDIR_RE = re.compile(r"^(?:[0-9]+)?(<<<|<<|<|>>|>&|&>>|&>|>\||<>|>)(.*)$")
-
-
-# ── 字面性闸与范围判定（board #129 收敛共识：dsh #3055 §6-1/#3061 §2、grok #3054
-#    High/#3059 下一刀 1-3、pi #3058 §B、claude #3053 A-1/A-3、Bugbot 4722010420/4722010427）──
-# 事实基础（分词器 = shlex posix + punctuation_chars="();<>|&`$\n"，字符类由源码与
-# 实测钉死，见 Lib/shlex.py __init__：punctuation_chars 非空时 wordchars += '~-./*?='）：
-#   wordchars = 字母数字 + _ ~ - . / * ? = ；标点集 = ( ) ; < > | & ` $ \n ；
-#   其余可打印字符（[ ] { } , : 等）成为单字符分隔词元；posix 引号剥除后，
-#   含空白的词元必来自引号内容。未加引号的 $ 与 ` 是标点 ⇒ 把词切碎。
-# 词边界唯一硬规则：两个相邻 word 词元之间必有空白（否则分词器会并成一个词元）。
-# 其余相邻关系（frag/quoted 与任何词元）有无空白不可区分 ⇒ 按同词续接（宁枉勿纵）。
-
-_EXPANSION_CHARS = "*?[]{}$`"
-_WRITER_BASENAMES = (WRITER_MARK, WRITER_MARK + ".sh")
-_NAME_BASENAMES = set(_WRITER_BASENAMES) | {CLI_FILENAME}
-_WORDCHARS = set(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_~-./?*=")
-_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-_HEREDOC_DELIM_RE = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_]*|'[^']*'|\"[^\"]*\")$")
-# bash 保留字（与 gzx-capture.py _SHELL_RESERVED 同源口径）：保留字必须独立成词，
-# 其后的分隔词元（[ { 等）必是新词——否则 `if [ -s x ]` 的 if 与 [ 会被词重建
-# 粘成 `if[`（word→frag 边界有无空白不可区分，保留字是唯一可靠的断词信号）。
-_SHELL_RESERVED = {"if", "then", "else", "elif", "fi", "while", "until", "do",
-                   "done", "for", "case", "esac", "in", "function", "time",
-                   "!", "coproc", "select"}
-# 权威来源：python3 --help（3.12 实测）。-c/-m/- 终止选项表（其后无脚本位）。
-_PY_NOARG_OPTS = {"-b", "-B", "-d", "-E", "-h", "-i", "-I", "-O", "-OO", "-P",
-                  "-q", "-s", "-S", "-u", "-v", "-V", "-?", "--help",
-                  "--help-env", "--help-xoptions", "--help-all", "--version"}
-_PY_CONSUME_OPTS = ("-W", "-x", "-X", "--check-hash-based-pycs")
-_PY_STOP_OPTS = {"-c", "-m", "-"}
-
-
-def _has_expansion(s):
-    return any(c in _EXPANSION_CHARS for c in s)
-
-
-def _head_static_prefix(w):
-    """命令名词的静态前缀：到第一个扩展算子/非 wordchar 碎片边界为止。
-    'echo$HOME' → 'echo'（$ 处是碎片边界，动态部分可能是独立参数——word→frag
-    边界的空白不可区分，命令名闸只认静态前缀）；'$SCRIPT' → ''（命令名以动态
-    字符开头 ⇒ 不可证）；'gzx-*.sh' → 全词（* ? 是 wordchar，通配在词内）。"""
-    for idx, c in enumerate(w):
-        if c in _EXPANSION_CHARS or c not in _WORDCHARS:
-            return w[:idx]
-    return w
-
-
-def _tok_kind(t):
-    """word=wordchar 连续串；quoted=含空白（必来自引号内容，永不为操作符）；
-    frag=标点串或单字符分隔符。"""
-    if " " in t or "\t" in t or "\r" in t:
-        return "quoted"
-    if all(c in _WORDCHARS for c in t):
-        return "word"
-    return "frag"
-
-
-def _segment_words(frags):
-    """把一个段内的词元重建为「词」：[(文本, 是否含引用内容)]。
-    相邻 word+word ⇒ 新词（必有空白）；**quoted 词元必自成一个词**（posix 邻接
-    引号会并入前词元——独立的 quoted 词元证明其前必有空白，claude #3065 §2：
-    否则 `bash "fake gzx-append.sh" map` 的引号参数被粘进命令头词，名字臂失明）；
-    词首孤立 [ 或 { 视为完整词（test 内建 / 花括号组保留基线语义）；
-    当前词恰为保留字时必断词（`if [` 的 if 与 [ 不可粘）。"""
-    out = []
-    cur = None      # (text, quoted)
-    prev_kind = None
-    for t in frags:
-        kind = _tok_kind(t)
-        q = kind == "quoted"
-        # quoted 词元两侧自定界：引号内容 posix 邻接会并入前词元，独立成词元
-        # 即证明其前后都有空白 ⇒ quoted 必开新词，其后一词也必开新词
-        new_word = cur is None or q or prev_kind == "quoted" or \
-            (prev_kind == "word" and kind == "word")
-        if cur is not None and cur[0] in _SHELL_RESERVED and not cur[1]:
-            new_word = True
-        if not new_word:
-            cur = (cur[0] + t, cur[1] or q)
-        else:
-            if cur is not None:
-                out.append(cur)
-            if t in ("[", "{"):
-                out.append((t, False))
-                cur = None
-            else:
-                cur = (t, q)
-        prev_kind = kind
-    if cur is not None:
-        out.append(cur)
-    return out
-
-
-def _name_components(tok):
-    """词元的名字候选组件：basename 按空白分段（`fake gzx-append.sh` 的
-    `gzx-append.sh` 段也算命中候选——写入器名含在带空格的引号路径里时
-    名字臂仍可达；身份层随后按精确解析判定）。"""
-    base = _basename(tok).replace("\\", "/")
-    comps = [c for c in base.split(" ") if c]
-    comps.append(base)
-    return comps
-
-
-def _split_segments(toks):
-    """按管道/结构符切段（不产生判定，供字面性闸与名字臂使用）。"""
-    segs = [[]]
-    for t in toks:
-        if t in STRUCTURE_DENY_TOKENS or "\n" in t:
-            segs.append([])
-            continue
-        if t in PIPE_TOKENS:
-            segs.append([])
-            continue
-        segs[-1].append(t)
-    return [s for s in segs if s]
-
-
-def _effective_head(words):
-    """跳过 VAR=… 赋值前缀后的命令名词元（无则 None）。"""
-    for w, _q in words:
-        if _ENV_ASSIGN_RE.match(w):
-            continue
-        return w
-    return None
-
-
-def _is_py_head(head):
-    if head in PYTHON_BINS:
-        return True
-    return head.endswith(".exe") and head[:-4] in PYTHON_BINS
-
-
-def _py_script_slot_idx(arg_toks):
-    """解释器段：按 python3 --help 选项表定位脚本位词元下标（无则 None）。"""
-    i = 0
-    n = len(arg_toks)
-    while i < n:
-        t = arg_toks[i]
-        if t in _PY_STOP_OPTS:
-            return None
-        if t in _PY_NOARG_OPTS:
-            i += 1
-            continue
-        if t.startswith(_PY_CONSUME_OPTS):
-            # 值连写（-Xutf8 / --check-hash-based-pycs=default）只跳自身；独立值形式吃下一个词元
-            i += 1 if ("=" in t or len(t) > 2) else 2
-            continue
-        if t.startswith("-"):
-            return None       # 未知选项：保守——不认定脚本位
-        return i
-    return None
 
 
 def _find_heredoc_delims(cmdline):
@@ -497,221 +618,106 @@ def _strip_heredocs(cmd):
     return cmdline, bodies, "ok"
 
 
-def _pregate_expansion(toks, segments, seg_words):
-    """字面性闸（与范围无关，进出范围两向都拦）。返回 deny Decision 或 None。
-    位置：a. 各段有效命令名；b. bash/sh/source/. 段的全部未引用参数
-    （bash 展开一切参数通配）；c. python/python3 段全部未引用参数（保守，防
-    脚本位被选项推后）；d. 输出重定向目标（含被 $ ` [ { 劈碎的续接碎片）。"""
-    for seg, words in zip(segments, seg_words):
-        head_w = _effective_head(words)
-        if head_w is None:
-            continue
-        if head_w not in ("[", "{"):
-            prefix = _head_static_prefix(head_w)
-            if _has_expansion(prefix) or prefix == "":
-                return Decision(False, "expansion:unprovable")
-            # 邻接引号并入命令头词（bash"fake…"map，token 含空白即证据）：
-            # 静态前缀是执行位名，或头词内含写入器/CLI 名（'bash'与引号内容的
-            # 边界不可恢复，名字可能被截断——claude #3065 §2 形态 (b)）⇒ 不可证拒
-            if (" " in head_w or "\t" in head_w) and (
-                    prefix.lower() in SHELL_WRAPPERS or _is_py_head(prefix.lower())
-                    or any(n in head_w for n in _NAME_BASENAMES)):
-                return Decision(False, "expansion:unprovable")
-        else:
-            prefix = head_w
-        head_base = prefix.lower()
-        is_wrapper = head_base in SHELL_WRAPPERS
-        is_py = _is_py_head(head_base)
-        if is_wrapper or is_py:
-            # 参数闸（含命令名词里粘着的动态尾巴：bash$SCRIPT 的 $SCRIPT 就是
-            # 它的第一个参数——word→frag 边界的空白不可区分，按参数对待）。
-            # 引用串（含空白）豁免 expansion 闸；其写入器/CLI 名组件由名字臂
-            # 进范围后交身份层判定（claude #3065 §2 修法 (a)）。
-            arg_words = []
-            if head_w != prefix:
-                arg_words.append((head_w[len(prefix):], False))
-            arg_words.extend(words[1:])
-            for w, q in arg_words:
-                if not q and _has_expansion(w):
-                    return Decision(False, "expansion:unprovable")
-    # 输出重定向目标：op 的 tail + 其后按词边界续接的碎片
-    i = 0
-    n = len(toks)
-    while i < n:
-        t = toks[i]
-        if t in STRUCTURE_DENY_TOKENS or "\n" in t or t in PIPE_TOKENS:
-            i += 1
-            continue
-        m = _REDIR_RE.match(t)
-        if not m:
-            if t in ("<", "<<<"):
-                i += 2
-                continue
-            i += 1
-            continue
-        target = m.group(2)
-        j = i + 1
-        prev_kind = "frag" if target else None
-        # tail 为空时目标是下一个词元起；续接规则与 _segment_words 一致
-        while j < n:
-            nt = toks[j]
-            if nt in STRUCTURE_DENY_TOKENS or "\n" in nt or nt in PIPE_TOKENS:
-                # 目标区域内的结构算子（$( ` 等）含扩展字符 ⇒ 目标不可证；否则目标完整
-                if _has_expansion(nt):
-                    return Decision(False, "expansion:unprovable")
-                break
-            kind = _tok_kind(nt)
-            if target and prev_kind == "word" and kind == "word":
-                break                     # 两个 word 相邻 ⇒ 必有空白 ⇒ 目标已完整
-            m2 = _REDIR_RE.match(nt)
-            if m2 and _tok_kind(nt) != "quoted":
-                break                     # 下一个重定向操作符
-            target += nt
-            prev_kind = kind
-            j += 1
-        if target and _has_expansion(target):
-            return Decision(False, "expansion:unprovable")
-        i = j if j > i else i + 1
-    return None
-
-
-def _name_arm_hit(segments):
-    """名字臂（臂③，进范围的第三条件）：执行位的写入器/CLI 名按**原始词元**
-    basename 相等（含引用参数的空白分段组件——`bash "fake gzx-append.sh" map`
-    的引号参数名含写入器名，claude #3065 §2）进范围；禁全文正则。
-    走 raw token 而非重建词（grok #3069 §2：`bash --rcfile "a b" gzx-append.sh`
-    的选项+引号值+脚本位会被词重建粘成一个词，重建词层的名字检查被打穿——
-    原始词元层 `gzx-append.sh` 独立可见）。执行位 = 有效命令名、bash/sh/source/.
-    的参数、python/python3 的脚本位。git add / echo 的参数不在执行位 ⇒ 同仓
-    三条保持放行（pi #3058 §B-3）。"""
-    for seg in segments:
-        head_t = seg[0]
-        rest = seg[1:]
-        while _ENV_ASSIGN_RE.match(head_t) and rest:
-            head_t = rest[0]
-            rest = rest[1:]
-        head_base = _basename(head_t).lower()
-        if head_base.endswith(".exe"):
-            head_base = head_base[:-4]
-        if head_base in _NAME_BASENAMES:
-            return True
-        if head_base in SHELL_WRAPPERS:
-            if any(any(c.lower() in _NAME_BASENAMES for c in _name_components(t))
-                   for t in rest):
-                return True
-        elif _is_py_head(head_base):
-            idx = _py_script_slot_idx(rest)
-            if idx is not None:
-                if any(c.lower() in _NAME_BASENAMES
-                       for c in _name_components(rest[idx])):
-                    return True
-    return False
-
-
-def _in_scope_tokens(toks, bodies, segments):
-    """token 级范围判定（dsh #3055 §6-1：范围门挪到分词之后）。
-    任一命令行词元含数据目录标记，或 heredoc 正文含标记，或名字臂命中 ⇒ 进范围。"""
-    for t in toks:
-        low = t.lower()
-        for m in _protected_markers():
-            if m in t or m.lower() in low:
-                return True
-    for b in bodies:
-        low = b.lower()
-        for m in _protected_markers():
-            if m in b or m.lower() in low:
-                return True
-    return _name_arm_hit(segments)
-
-
-def _check_redirect(toks, i):
-    """统一的重定向检查与目标消费（修复 $ 劈裂、输入重定向与只读穿透）。
-    返回 (is_redir, decision_if_deny, next_i)。若非重定向，返回 (False, None, i)。"""
-    t = toks[i]
-    m = _REDIR_RE.match(t)
-    if not m:
-        # 输入重定向（<, <<<）：只读行为，跳过其目标操作数，不当作输出写目标
-        if t in ("<", "<<<"):
-            return True, None, min(i + 2, len(toks))
-        return False, None, i
-
-    op = m.group(1)
-    tail = m.group(2)
-    next_i = i + 1
-    target_parts = []
-    if tail:
-        target_parts.append(tail)
-    else:
-        if next_i >= len(toks):
-            return True, Decision(False, "redirect:missing-target"), next_i
-        target_parts.append(toks[next_i])
-        next_i += 1
-
-    # 数字目标（fd 复制，如 2>&1 或 1>&2），重定向自身已封闭，绝不向下多吞普通参数
-    if len(target_parts) == 1 and target_parts[0].isdigit() and op in (">&", ">"):
-        return True, None, next_i
-
-    # $ 碎片拼接启发式已移除：含 $/`/[/{ 的目标在前置字面性闸（_pregate_expansion，
-    # 范围无关）一律 deny expansion:unprovable，到不了这里——拼接式「拼出像不像受
-    # 保护路径」判据被 $ 断片 / 字面前缀+$ / 通配符三族实证绕过，判据必须是
-    # 「没有扩展算子」（board #129 dsh #3061 §2 收敛）。
-
-    full_target = "".join(target_parts)
-    if _is_protected(full_target) or any(_is_protected(p) for p in target_parts):
-        return True, Decision(False, "redirect-to-protected:" + op), next_i
-
-    return True, None, next_i
-
-
 def _check_heredoc_first_line(cmd, delim, body, is_cli=False):
+    """官方 writer / CLI heredoc 例外：定界符唯一且末行、首行恰一个 <<、无结构符、
+    重定向不落数据目录，且命令名确是官方件（解析路径精确相等）。"""
     lines = cmd.split("\n")
     if lines and lines[-1] == "":
         lines = lines[:-1]
     lines = [l.rstrip("\r") for l in lines]
     if [i for i, l in enumerate(lines) if l == delim] != [len(lines) - 1]:
         return Decision(False, "heredoc:delim_repeats")
-    first = lines[0]
-    toks, tok_err = _structure_tokens(first)
-    if tok_err or sum(1 for t in toks if t == "<<") != 1 \
-            or any(t.startswith("<<") and t != "<<" for t in toks):
+    toks, err = _lex(lines[0])
+    hd = [t for t in toks if t.kind == "o" and t.text in ("<<", "<<-", "<<<")]
+    if err or len(hd) != 1 or hd[0].text != "<<":
         return Decision(False, "heredoc:operator")
-    i2 = 0
-    while i2 < len(toks):
-        t = toks[i2]
-        if t in STRUCTURE_DENY_TOKENS or "\n" in t:
-            return Decision(False, "structure:" + t.replace("\n", "\\n")[:24])
-        is_redir, d_redir, next_i2 = _check_redirect(toks, i2)
-        if is_redir:
-            if d_redir:
-                return d_redir
-            i2 = next_i2
-            continue
-        i2 += 1
+    for t in toks:
+        if t.kind == "o":
+            if t.text in _STRUCT_OPS:
+                return Decision(False, _structure_rule(t.text))
+        elif t.subst:
+            return Decision(False, "structure:" + ("$(" if "$(" in t.text else "`"))
+    cmds = _parse_chunks(toks)
+    if len(cmds) != 1:
+        return Decision(False, "heredoc:operator")
+    c = cmds[0]
+    for op, tgt in _output_targets(c["redirs"]):
+        if tgt is None:
+            return Decision(False, "redirect:missing-target")
+        if _is_protected(tgt):
+            return Decision(False, "redirect-to-protected:" + op)
+    head = c["head"]
     if is_cli:
-        if len(toks) < 2 or not _is_cli_segment(toks):
+        ok = (head is not None and _is_py_name(_cmd_name(head.text))
+              and any(_name_hit(t.text) == ("path", t.text, CLI_FILENAME)
+                      and _identity_ok(t.text, CLI_FILENAME) for t in c["words"]))
+        if not ok:
             return Decision(False, "heredoc:cli_identity")
         return Decision(True, "cli-heredoc:%dB" % len(body.encode("utf-8")))
-    if not toks or not _is_writer_token(toks[0]):
+    hit = _name_hit(head.text) if head is not None else None
+    if not (hit and hit[0] == "path" and hit[2] in _WRITER_BASENAMES
+            and _identity_ok(hit[1], hit[2])):
         return Decision(False, "heredoc:writer_identity")
     return Decision(True, "writer-heredoc:%dB" % len(body.encode("utf-8")))
+
+
+_BOOTSTRAP_SRC_NAMES = {"gzx-append.sh", "gzx_lock_append.py"}
+_BOOTSTRAP_SETUP = {"mkdir", "chmod"}
+
+
+def _seg_is_bootstrap(head, args):
+    """引导安装豁免：cp 官方件到数据目录 / mkdir 数据目录 / chmod 仅两种形状。
+    head=命令名（_cmd_name），args=命令名之后的参数文本。"""
+    cur_dir = GZX_DIR
+    if head in ("cp", "install"):
+        if len(args) != 2:
+            return False
+        src_path = os.path.expanduser(args[0])
+        src = _basename(src_path)
+        dst_path = os.path.expanduser(args[1])
+        dst = _basename(dst_path)
+        dst_dir = os.path.dirname(dst_path)
+        if (src not in _BOOTSTRAP_SRC_NAMES
+                or dst not in _BOOTSTRAP_SRC_NAMES
+                or _canon_path(dst_dir) != _canon_path(cur_dir)):
+            return False
+        return _canon_path(src_path) == _canon_path(
+            os.path.join(_plugin_skill_dir(), src))
+    if head in _BOOTSTRAP_SETUP:
+        aa = [t for t in args if not (t.isdigit() and len(t) == 1)]
+        pathish = [t for t in aa if ("/" in t or "\\" in t or t.startswith("~"))]
+        if head == "mkdir":
+            targets = [t for t in aa if not t.startswith("-")]
+            return (bool(targets)
+                    and all(_canon_path(t) == _canon_path(cur_dir) for t in targets))
+        modeparts = [t for t in aa if t not in pathish]
+        if len(pathish) != 1 or not modeparts:
+            return False
+        mode = "".join(modeparts)
+        if mode.startswith("-"):
+            return False
+        target = pathish[0]
+        if _canon_path(target) == _writer_installed_path():
+            return "+" in mode and "x" in mode
+        if _canon_path(target) == _canon_path(cur_dir):
+            return mode == "700"
+        return False
+    return False
 
 
 def classify(cmd):
     """对一条 Bash 命令做守卫判定。返回 Decision。纯函数，便于测试。
 
-    流序（board #129 收敛共识，dsh #3055 §6-1 / #3061 §2、grok #3059 下一刀 1-3、
-    pi #3058 §B、claude #3053 A-1/A-3、Bugbot 4722010420/4722010427）：
-    0. 官方 writer/CLI heredoc 例外 → 身份层（与基线一致，先于一切）；
-    1. heredoc 正文剥离（正文是数据不是 shell，判定只看命令行；pi #3058 §B-2：
-       包装器 + heredoc 形态此前到不了身份层，剥离后可达）；剥不动 ⇒ 拒；
-    2. 分词命令行；失败 ⇒ structure:unparseable（dsh #3055 §6-1 默认拒）；
-    3. 字面性闸（与范围无关）：命令名 / 包装器与解释器参数 / 输出重定向目标
-       含扩展算子 ⇒ expansion:unprovable；
-    4. 范围门：标记词元 ∨ heredoc 正文标记 ∨ 名字臂（执行位 basename 相等）；
-    5. 范围外 ⇒ 放行 out-of-scope（零审计，与基线一致）；
-    6. 范围内：非官方 heredoc ⇒ structure:heredoc（基线由换行结构符拒，剥离后
-       改由本规则承担）；结构符/重定向/逐段检查与基线同序。"""
-    # 0. 臂③：writer / CLI heredoc 语法必须进入身份层检验（即使正文不含保护目录字样，假写入器也必拒）
+    流序（board #129 收敛共识）：
+    0. 官方 writer / CLI heredoc 例外 → 身份层（与基线一致，先于一切）；
+    1. heredoc 正文剥离（正文是数据不是 shell，判定只看命令行）；剥不动 ⇒ 拒；
+    2. 分词（一遍扫出词与操作符）；失败 ⇒ structure:unparseable（默认拒）；
+    3. 与范围无关的三道闸（_gates）：重定向目标字面 / 命令名字面 /
+       启动器命令里的官方名必须在固定位；
+    4. 范围门：词里引用数据目录 ∨ heredoc 正文含标记 ∨ 启动器命令里出现已核实的官方名；
+    5. 范围外 ⇒ 放行 out-of-scope；
+    6. 范围内：结构符 / 命令替换 / 重定向落数据目录 / 逐命令块前缀检查，与基线同序。"""
+    # 0. 官方 writer / CLI heredoc 语法必须进入身份层检验（即使正文不含保护目录字样，假写入器也必拒）
     m = _HEREDOC_WRITER_RE.match(cmd)
     if m:
         return _check_heredoc_first_line(cmd, m.group(3), m.group(4), is_cli=False)
@@ -732,64 +738,70 @@ def classify(cmd):
             has_heredoc = True
 
     # 2. 分词
-    toks, err = _structure_tokens(work)
+    toks, err = _lex(work)
     if err:
         return Decision(False, "structure:unparseable")
+    cmds = _parse_chunks(toks)
 
-    # 3. 字面性闸（范围无关，进出范围两向都拦）
-    segments = _split_segments(toks)
-    seg_words = [_segment_words(s) for s in segments]
-    d_gate = _pregate_expansion(toks, segments, seg_words)
+    # 3. 与范围无关的三道闸
+    d_gate, official = _gates(cmds)
     if d_gate:
         return d_gate
 
-    # 4./5. 范围门（token 级标记 + heredoc 正文标记 + 名字臂）
-    if not _in_scope_tokens(toks, bodies, segments):
+    # 4./5. 范围门
+    in_scope = bool(official) or any(_in_scope(b) for b in bodies)
+    if not in_scope:
+        for t in toks:
+            if t.kind == "w" and _in_scope(t.text):
+                in_scope = True
+                break
+    if not in_scope:
         return Decision(True, "out-of-scope")
 
-    # 6. 范围内主循环（基线同序：结构符拒 → 管道分段 → 重定向判定）
-    segments = [[]]
-    i = 0
-    n = len(toks)
-    while i < n:
-        t = toks[i]
-        if t in STRUCTURE_DENY_TOKENS or "\n" in t:
-            return Decision(False, "structure:" + t.replace("\n", "\\n")[:24])
-        if t in PIPE_TOKENS:
-            segments.append([])
-            i += 1
+    # 6. 范围内（基线同序：结构符拒 → 重定向判定 → 逐命令块检查）
+    redir_at = {}
+    for c in cmds:
+        for t, op, tgt in c["redirs"]:
+            redir_at[t] = (op, tgt)
+    for t in toks:
+        if t.kind == "o":
+            if t.text in _STRUCT_OPS:
+                return Decision(False, _structure_rule(t.text))
+            r = redir_at.get(t)
+            if r is not None and _is_file_output(r[0], r[1]):
+                if r[1] is None:
+                    return Decision(False, "redirect:missing-target")
+                if _is_protected(r[1]):
+                    return Decision(False, "redirect-to-protected:" + r[0])
+        elif t.subst:
+            # 命令替换会执行嵌套命令，只读白名单管不到它（含藏在双引号里的形态）
+            return Decision(False, "structure:" + ("$(" if "$(" in t.text else "`"))
+    for ci, c in enumerate(cmds):
+        words = c["words"]
+        if not words:
             continue
-        is_redir, d_redir, next_i = _check_redirect(toks, i)
-        if is_redir:
-            if d_redir:
-                return d_redir
-            i = next_i
+        head = c["head"]
+        if c["assign_only"]:
+            # 纯赋值行（基线行为保持：提到数据目录 / 官方名的赋值行仍拒）
+            return Decision(False, "prefix:" + _basename(words[0].text))
+        name = _cmd_name(head.text)
+        args = [t.text for t in words[words.index(head) + 1:]]
+        if name == "find":
+            for a in args:
+                if a in FIND_DENY_FLAGS:
+                    return Decision(False, "find:" + a)
+        if name in ("sed", "perl"):
+            for a in args:
+                if a == "-i" or (a.startswith("-i") and len(a) > 2 and a[2] != "n"):
+                    return Decision(False, name + ":-i")
+        if _seg_is_bootstrap(name, args):
             continue
-        segments[-1].append(t)
-        i += 1
-
-    for seg in segments:
-        if not seg:
+        if name in READONLY_PREFIX or ci in official:
             continue
-        head = _basename(seg[0])
-        if head == "find":
-            for t in seg[1:]:
-                if t in FIND_DENY_FLAGS:
-                    return Decision(False, "find:" + t)
-        if head in ("sed", "perl"):
-            for t in seg[1:]:
-                if t == "-i" or (t.startswith("-i") and len(t) > 2 and t[2] != "n"):
-                    return Decision(False, head + ":-i")
-        if _seg_is_bootstrap(seg):
-            continue
-        if not _seg_head_is_allowed(seg):
-            return Decision(False, "prefix:" + head)
-        if _is_writer_token(seg[0]) or _is_cli_segment(seg):
-            continue
+        return Decision(False, "prefix:" + _basename(head.text))
 
     # 7. 非官方 heredoc（范围内）一律拒：正文是数据不是 shell，不可静态审计；
-    #    官方 writer/CLI 形态已在第 0 步进身份层。基线此形状由换行结构符拒绝
-    #    （正文含换行），正文剥离后改由本规则承担，拒绝方向不变。
+    #    官方 writer / CLI 形态已在第 0 步进身份层。
     if has_heredoc:
         return Decision(False, "structure:heredoc")
 
@@ -864,6 +876,11 @@ def _handle(event):
     return 0
 
 
+def _head_is_official(text):
+    hit = _name_hit(text)
+    return bool(hit) and hit[0] == "path" and _identity_ok(hit[1], hit[2])
+
+
 def selftest():
     # 自检是测试入口：Windows CI 运行器控制台编码非 UTF-8（cp1252 实测），本函数
     # 打印中文 SKIP/FAIL 行即 UnicodeEncodeError。输出强制 UTF-8，与控制台无关。
@@ -873,41 +890,67 @@ def selftest():
         except Exception:
             pass
     _pkg_skill = _posix_form(_plugin_skill_dir())
+    _cli_native = os.path.join(_plugin_skill_dir(), CLI_FILENAME)
+    _E = "/tmp/evil/gzx-append.sh"
     allows = [
+        # ── 只读 ──
         "sha256sum ~/.gan-zhong-xue/map.md",
         "grep -i 先猜 ~/.gan-zhong-xue/map.md",
         "grep 先猜 ~/.gan-zhong-xue/map.md | head",
         "grep 先猜 ~/.gan-zhong-xue/map.md|head",
         "cat ~/.gan-zhong-xue/map.md > /dev/null",
         "cat ~/.gan-zhong-xue/map.md 2>/dev/null",
-        "echo \"a > b\"",
-        "~/.gan-zhong-xue/gzx-append.sh map < payload",
-        # 裸名直调依赖 PATH 解析到官方安装位：装了才测，没装显式跳过（dsh #3055 §3：
-        # 不许用 fail-open 换绿灯；用例按安装态条件生效，两种环境都诚实）
-        ("gzx-append map", "writer-on-path"),
-        ("bash gzx-append.sh map", "writer-on-path"),
-        "cat payload | ~/.gan-zhong-xue/gzx-append.sh candidates",
-        "bash ~/.gan-zhong-xue/gzx-append.sh map",
-        "cp '%s/gzx-append.sh' ~/.gan-zhong-xue/gzx-append.sh" % _pkg_skill,
-        "mkdir -p ~/.gan-zhong-xue",
-        "chmod 700 ~/.gan-zhong-xue",
-        "chmod +x ~/.gan-zhong-xue/gzx-append.sh",
-        "cp '%s/gzx_lock_append.py' ~/.gan-zhong-xue/gzx_lock_append.py" % _pkg_skill,
+        "cat 2>&1 ~/.gan-zhong-xue/map.md",
+        "cat > /tmp/out < ~/.gan-zhong-xue/map.md",
+        "cat < ~/.gan-zhong-xue/map.jsonl",
         "ls ~/.gan-zhong-xue/gzx-append.sh 2>/dev/null",
         "cat ~/.gan-zhong-xue/pending.md 2>/dev/null",
         "cat ~/.gan-zhong-xue/candidates.jsonl 2>/dev/null",
+        "grep $PAT ~/.gan-zhong-xue/map.md",
+        "FOO=bar cat ~/.gan-zhong-xue/map.md",
+        # ── 官方写入器 / 官方 CLI（命令名是官方名，或启动器链 + 已核实的官方名）──
+        "~/.gan-zhong-xue/gzx-append.sh map < payload",
         "~/.gan-zhong-xue/gzx-append.sh pending-clear",
-        ("gzx-append pending-clear", "writer-on-path"),
         "~/.gan-zhong-xue/gzx-append.sh badtarget </dev/null",
-        # v1.2.0: 聚合 CLI 与同仓开发不再被误杀
+        "~/.gan-zhong-xue/gzx-append.sh jsonl <<< '{\"id\":2}'",
+        "cat payload | ~/.gan-zhong-xue/gzx-append.sh candidates",
+        "bash ~/.gan-zhong-xue/gzx-append.sh map",
+        "'~/.gan-zhong-xue/gzx-append.sh' map",
+        "bash \"~/.gan-zhong-xue/gzx-append.sh\" map",
+        "bash.exe ~/.gan-zhong-xue/gzx-append.sh map",
+        "env FOO=bar ~/.gan-zhong-xue/gzx-append.sh map",
+        "FOO=bar bash ~/.gan-zhong-xue/gzx-append.sh map",
         "python3 '%s/gzx_cli.py' preflight" % _pkg_skill,
+        "python3 %s/gzx_cli.py preflight" % _pkg_skill,
+        "python3 '%s/gzx_cli.py' cell '<概念>'" % _pkg_skill,
+        # 解释器选项不再影响判定（旧选项表写差即漏；现只问名字在不在固定位）
+        "python3 -W ignore '%s/gzx_cli.py' preflight" % _pkg_skill,
+        "python3 -X dev '%s/gzx_cli.py' preflight" % _pkg_skill,
+        "python3 --check-hash-based-pycs default '%s/gzx_cli.py' preflight" % _pkg_skill,
+        "python3 -- '%s/gzx_cli.py' preflight" % _pkg_skill,
+        "python.exe '%s' preflight" % _cli_native,
         ("python3 '%s/gzx_cli.py' save-cell <<'GZX_JSON_EOF'\n"
          '{"概念":"~/.gan-zhong-xue 范围测试","分层":"🟡","来源":"🟢自","先猜":"猜","验证题":"题","状态":"待复验"}\n'
          "GZX_JSON_EOF") % _pkg_skill,
-        "cd /tmp/gan-zhong-xue && git status",
-        "git commit -m \"fix gan-zhong-xue bug\"",
-        "python3 hooks/test-gzx-invariants.py",
-        # 带引号的写入器 heredoc 路径
+        # 裸名直调（命令名位）依赖 PATH 解析到官方安装位：装了才测，没装显式跳过
+        # （dsh #3055 §3：不许用 fail-open 换绿灯；用例按安装态条件生效，两种环境都诚实）。
+        # 裸名出现在**参数位**则一律拒、不设安装态条件——见下方 identity 钉的注释。
+        ("gzx-append map", "writer-on-path"),
+        ("gzx-append pending-clear", "writer-on-path"),
+        # 启动器链 + 官方写入器的**路径**形态
+        "env ~/.gan-zhong-xue/gzx-append.sh map",
+        "sudo -n ~/.gan-zhong-xue/gzx-append.sh map",
+        "timeout 5 ~/.gan-zhong-xue/gzx-append.sh map",
+        "command ~/.gan-zhong-xue/gzx-append.sh map",
+        "exec ~/.gan-zhong-xue/gzx-append.sh map",
+        "source ~/.gan-zhong-xue/gzx-append.sh map",
+        # ── 引导安装 ──
+        "cp '%s/gzx-append.sh' ~/.gan-zhong-xue/gzx-append.sh" % _pkg_skill,
+        "cp '%s/gzx_lock_append.py' ~/.gan-zhong-xue/gzx_lock_append.py" % _pkg_skill,
+        "mkdir -p ~/.gan-zhong-xue",
+        "chmod 700 ~/.gan-zhong-xue",
+        "chmod +x ~/.gan-zhong-xue/gzx-append.sh",
+        # ── 官方 writer heredoc（引号 / 无引号路径）──
         ("'~/.gan-zhong-xue/gzx-append.sh' map <<'GZX_MD_EOF'\n"
          "## 概念示例\n"
          "GZX_MD_EOF"),
@@ -923,28 +966,159 @@ def selftest():
          "- 未挖点: 示例\n"
          "PENDING_EOF"),
         "~/.gan-zhong-xue/gzx-append.sh map <<'E'\n## 概念\nE\n",
-        "~/.gan-zhong-xue/gzx-append.sh jsonl <<< '{\"id\":2}'",
-        # Bugbot 新增防护用例：只读形态含 2>&1 或输入重定向放行，同仓 git 命令放行
-        "cat 2>&1 ~/.gan-zhong-xue/map.md",
-        "cat > /tmp/out < ~/.gan-zhong-xue/map.md",
+        # ── 同仓开发：命令名不是启动器类 = 只是在处理一个叫这名字的文件 ──
+        "cd /tmp/gan-zhong-xue && git status",
+        "git commit -m \"fix gan-zhong-xue bug\"",
+        "python3 hooks/test-gzx-invariants.py",
         "git add skills/gan-zhong-xue/gzx_cli.py",
         "git commit -m 'update gzx_cli.py'",
-        # #129 收敛放行面回归钉（pi #3058 §B-3 同仓三条）：名字臂只认执行位
+        "git commit -m \"touch gzx_cli.py\"",
         "echo see gzx-append",
+        "grep -n gzx-append SKILL.md",
+        "cp skills/gan-zhong-xue/gzx_cli.py /tmp/x.py",
+        "ls -l gzx-append.sh",
+        "vim gzx_cli.py",
+        "find . -name gzx_cli.py",
+        "cat gzx_cli.py",
         "echo $HOME",
-        "grep $PAT ~/.gan-zhong-xue/map.md",
-        "python3 -m py_compile skills/gan-zhong-xue/gzx_cli.py",
-        # 引号参数良性形态（claude #3065 §2 修复不放伤 benign 引号参数）
         "bash \"my notes.txt\"",
         "bash\"my notes.txt\"",
+        # ── 范围外日常命令（词法底座对照：冒号 / 算术 / heredoc / 注释不误伤）──
+        "echo \"a > b\"",
+        "ls *.py",
+        "find . -name '*.py'",
+        "echo $(( 1 << 2 ))",
+        "[ -s /tmp/x ]",
+        "git log --oneline -10 2>/dev/null",
+        "git diff HEAD~1 --stat 2>/dev/null",
+        "FOO=bar cmd",
+        "PATH=/usr/bin:/bin cmd",
+        "cd $HOME && make",
+        "cat <<EOF > /tmp/y\nbody $X\nEOF",
+        "cat <<-EOF\n\tindented\n\tEOF",
+        "python3 - <<'PY'\nprint('$x')\nPY",
+        "grep '<<' notes.txt",
+        "find . -name '*.py' -exec python3 -m py_compile {} \\;",
+        "xargs -I{} bash -c 'echo $0' {}",
+        "nohup python3 server.py --port $PORT",
+        "cmd > out $ARGS",
+        "cmd 2>/dev/null $ARG",
+        "echo '> $HOME'",
+        # ── 已申报边界（每条在这里有一条 allow 钉「当前不审计」，并与一条 deny 钉配对；
+        #    README「已知边界」逐条对应，dsh #3072 §1-1 对价 (ii)）──
+        "bash -c 'ls'",
+        "bash -c 'cat x > $HOME/y'",                  # 载荷不含官方名 = 不审计
+        "sudo bash $SCRIPT map",                      # 泛启动器后的非字面参数不查
+        "rm map.md",                                  # cd 进数据目录后不提名字
+        "bash /tmp/evil.sh",                          # 完全不出现官方名与数据目录的脚本
     ]
     denies = [
-        # Bugbot 新增防护用例：shell wrapper 运行本地目录伪造写入器触碰数据目录必拒
-        ("bash ./gzx-append.sh map < ~/.gan-zhong-xue/pending.md", "prefix:bash"),
-        # 裸名经包装器：which 解析不到官方安装位必拒；解析得到（写环境装了官方写入器
-        # 且 PATH 可达）则合法直调 → 该钉按安装态条件生效（两种环境都诚实）
-        ("bash gzx-append.sh map < ~/.gan-zhong-xue/pending.md", "prefix:bash",
-         "writer-not-on-path"),
+        # ── 假写入器 / 假 CLI：官方名不在固定位（identity:<名字>）──
+        ("bash ./gzx-append.sh map < ~/.gan-zhong-xue/pending.md", "identity:gzx-append.sh"),
+        ("bash gzx-append.sh map < ~/.gan-zhong-xue/pending.md",
+         "identity:gzx-append.sh"),
+        ("python3 /tmp/evil/gzx_cli.py save-cell", "identity:gzx_cli.py"),
+        ("python3 -u /tmp/evil/gzx_cli.py save-cell", "identity:gzx_cli.py"),
+        ("/tmp/evil/gzx-append.sh map", "identity:gzx-append.sh"),
+        ("sh /tmp/evil/gzx-append.sh map", "identity:gzx-append.sh"),
+        ("bash -x /tmp/evil/gzx-append.sh map", "identity:gzx-append.sh"),
+        ("gzx-append.sh map", "identity:gzx-append.sh", "writer-not-on-path"),
+        ("bash gzx-append.sh map", "identity:gzx-append.sh"),
+        ("bash gzx-append.sh map <<E\nhello\nE", "identity:gzx-append.sh"),
+        ("bash /tmp/evil/gzx-append.sh map <<'E'\nhello\nE", "identity:gzx-append.sh"),
+        ("bash --rcfile \"a b\" gzx-append.sh", "identity:gzx-append.sh"),
+        ("python3 -X \"pycache_prefix=/tmp/a b\" /tmp/evil/gzx_cli.py save-cell",
+         "identity:gzx_cli.py"),
+        ("bash --rcfile /dev/null gzx-append.sh", "identity:gzx-append.sh"),
+        ("python3 -X pycache_prefix=/tmp/ab /tmp/evil/gzx_cli.py save-cell", "identity:gzx_cli.py"),
+        # Bugbot 4727029062（High）：Python 选项表写差的三形态——名字出现即查路径，与选项无关
+        ("python3 -x /tmp/evil/gzx_cli.py save-cell", "identity:gzx_cli.py"),
+        ("python3 --check-hash-based-pycs default /tmp/evil/gzx_cli.py save-cell",
+         "identity:gzx_cli.py"),
+        ("python3 -- /tmp/evil/gzx_cli.py save-cell", "identity:gzx_cli.py"),
+        # dsh #3072 §1-2 判别用例：与上一组同一个 rule 名（判「全部位置」而非「脚本位」）
+        ("python3 -W ignore /tmp/evil/gzx_cli.py save-cell", "identity:gzx_cli.py"),
+        ("python3 -X dev /tmp/evil/gzx_cli.py save-cell", "identity:gzx_cli.py"),
+        # Bugbot 4727166297（High）：冒号切分——PATH 前缀 / 选项值里的冒号不再把命令名认错
+        ("PATH=/usr/bin:/bin gzx-append.sh map", "identity:gzx-append.sh"),
+        ("PATH=/usr/bin:/bin bash /tmp/evil/gzx-append.sh map", "identity:gzx-append.sh"),
+        # 命令自带 PATH= 前缀时裸名解析不可证（守卫按自己的 PATH 找，bash 按命令里的 PATH 找）
+        ("PATH=/tmp/evil bash gzx-append.sh map", "identity:gzx-append.sh"),
+        ("env PATH=/tmp/evil bash gzx-append.sh map", "identity:gzx-append.sh"),
+        ("A=1 PATH=/usr/bin:/bin gzx-append.sh map", "identity:gzx-append.sh"),
+        ("python3 -X pycache_prefix=/tmp/a:b /tmp/evil/gzx_cli.py save-cell",
+         "identity:gzx_cli.py"),
+        ("python3 -W ignore:x /tmp/evil/gzx_cli.py save-cell", "identity:gzx_cli.py"),
+        # Bugbot 4727029063（Medium）：.exe 包装器
+        ("bash.exe /tmp/evil/gzx-append.sh map", "identity:gzx-append.sh"),
+        ("sh.exe /tmp/evil/gzx-append.sh map", "identity:gzx-append.sh"),
+        ("source.exe /tmp/evil/gzx-append.sh map", "identity:gzx-append.sh"),
+        # dsh #3066 §1-2 启动器探针 17 条：路径形态（无条件）
+        ("env bash %s map" % _E, "identity:gzx-append.sh"),
+        ("nice bash %s map" % _E, "identity:gzx-append.sh"),
+        ("timeout 5 bash %s map" % _E, "identity:gzx-append.sh"),
+        ("nohup bash %s map" % _E, "identity:gzx-append.sh"),
+        ("setsid bash %s map" % _E, "identity:gzx-append.sh"),
+        ("stdbuf -o0 bash %s map" % _E, "identity:gzx-append.sh"),
+        ("xargs -n1 bash %s map" % _E, "identity:gzx-append.sh"),
+        ("sudo bash %s map" % _E, "identity:gzx-append.sh"),
+        ("zsh %s map" % _E, "identity:gzx-append.sh"),
+        ("dash %s map" % _E, "identity:gzx-append.sh"),
+        ("busybox sh %s map" % _E, "identity:gzx-append.sh"),
+        ("su -c 'bash %s map'" % _E, "payload:gzx-append.sh"),
+        ("script -qc 'bash %s map'" % _E, "payload:gzx-append.sh"),
+        ("watch -n1 'bash %s map'" % _E, "payload:gzx-append.sh"),
+        ("bash -c 'sh %s map'" % _E, "payload:gzx-append.sh"),
+        ("bash -lc 'sh %s map'" % _E, "payload:gzx-append.sh"),
+        ("bash <<< '%s map'" % _E, "payload:gzx-append.sh"),
+        # dsh 17 条原文（裸名）。实测（与 test-gzx-behavior.py 同口径）：bash/sh 找脚本
+        # 参数时**先看当前目录再看 PATH**——当前目录里的同名假件会遮住 PATH 上的官方件，所以
+        # 参数位上的裸名与安装态无关、一律拒；合法直调请写路径或用命令名位（上方 writer-on-path 钉）。
+        ("env bash gzx-append.sh map", "identity:gzx-append.sh"),
+        ("nice bash gzx-append.sh map", "identity:gzx-append.sh"),
+        ("timeout 5 bash gzx-append.sh map", "identity:gzx-append.sh"),
+        ("nohup bash gzx-append.sh map", "identity:gzx-append.sh"),
+        ("setsid bash gzx-append.sh map", "identity:gzx-append.sh"),
+        ("stdbuf -o0 bash gzx-append.sh map", "identity:gzx-append.sh"),
+        ("xargs -n1 bash gzx-append.sh map", "identity:gzx-append.sh"),
+        ("sudo bash gzx-append.sh map", "identity:gzx-append.sh"),
+        ("zsh gzx-append.sh map", "identity:gzx-append.sh"),
+        ("dash gzx-append.sh map", "identity:gzx-append.sh"),
+        ("busybox sh gzx-append.sh map", "identity:gzx-append.sh"),
+        ("su -c 'bash gzx-append.sh map'", "payload:gzx-append.sh"),
+        ("script -qc 'bash gzx-append.sh map'", "payload:gzx-append.sh"),
+        ("watch -n1 'bash gzx-append.sh map'", "payload:gzx-append.sh"),
+        ("bash -c 'sh gzx-append.sh map'", "payload:gzx-append.sh"),
+        ("bash -lc 'gzx-append.sh map'", "payload:gzx-append.sh"),
+        ("bash <<< 'gzx-append.sh map'", "payload:gzx-append.sh"),
+        # 启动器族泛化形态（.exe / 版本号解释器 / 嵌套 / 命令替换里）
+        ("sudo -u root python3 -x /tmp/evil/gzx_cli.py save-cell", "identity:gzx_cli.py"),
+        ("env -i python3.12 /tmp/evil/gzx_cli.py save-cell", "identity:gzx_cli.py"),
+        ("perl /tmp/evil/gzx_cli.py", "identity:gzx_cli.py"),
+        ("node /tmp/evil/gzx_cli.py", "identity:gzx_cli.py"),
+        ("timeout --kill-after=5s env nice -n 5 bash /tmp/evil/gzx-append.sh map",
+         "identity:gzx-append.sh"),
+        ("exec bash /tmp/evil/gzx-append.sh map", "identity:gzx-append.sh"),
+        ("command bash /tmp/evil/gzx-append.sh map", "identity:gzx-append.sh"),
+        ("time bash /tmp/evil/gzx-append.sh map", "identity:gzx-append.sh"),
+        ("watch -n1 'gzx-append.sh'", "identity:gzx-append.sh"),
+        ("bash $(echo /tmp/evil/gzx-append.sh) map", "identity:gzx-append.sh"),
+        ("W=/tmp/evil/gzx-append.sh", "identity:gzx-append.sh"),
+        ("W=/tmp/evil/gzx-append.sh bash $W map", "identity:gzx-append.sh"),
+        # 引号参数族（claude #3065 §2 / pi #3067 §3 / grok #3069 §2）
+        ("bash \"fake gzx-append.sh\" map", "identity:gzx-append.sh"),
+        ("python3 \"fake gzx_cli.py\" save-cell", "identity:gzx_cli.py"),
+        ("bash \" gzx-append.sh\" map", "identity:gzx-append.sh"),
+        ("bash\"fake gzx-append.sh\"map", "expansion:unprovable"),
+        ("bash\"fake gzx_cli.py\"save-cell", "expansion:unprovable"),
+        ("echo\"see gzx-append\"", "identity:gzx-append"),
+        # bash -c 载荷（dsh #3072 §1-3：与 allow 的 `bash -c 'ls'` 配对；Bugbot 4727125345）
+        ("bash -c '~/.gan-zhong-xue/gzx-append.sh map'", "payload:gzx-append.sh"),
+        ("bash -c \"python3 '%s/gzx_cli.py' preflight\"" % _pkg_skill, "payload:gzx_cli.py"),
+        # 载荷里名字带内层引号（basename 不再干净）：程序串按子串判，dsh #3072 §1-4 (ii)
+        ("bash -c \"python3 '/tmp/evil/gzx_cli.py' save-cell\"", "payload:gzx_cli.py"),
+        ("bash -c 'cat ~/.gan-zhong-xue/map.md'", "prefix:bash"),
+        # ── 引导与数据目录直写（基线）──
         ("cp /tmp/gzx-append ~/.gan-zhong-xue/map.md", "prefix:cp"),
         ("cp /tmp/evil ~/.gan-zhong-xue/gzx-append.sh", "prefix:cp"),
         ("cp a ~/.gan-zhong-xue/gzx-append.sh b", "prefix:cp"),
@@ -959,62 +1133,71 @@ def selftest():
         ("cp /tmp/fake-plugin/gzx-append.sh ~/.gan-zhong-xue/gzx-append.sh", "prefix:cp"),
         ("chmod 777 ~/.gan-zhong-xue", "prefix:chmod"),
         ("chmod 755 ~/.gan-zhong-xue", "prefix:chmod"),
-        ("~/.gan-zhong-xue/gzx-append.sh map <<'E'\nx\nE\nrm ~/.gan-zhong-xue/map.md",
-         "structure"),
-        ("cat > ~/.gan-zhong-xue/map.md <<'E'\nx\nE", "redirect"),
+        ("cp ~/.gan-zhong-xue/map.md /tmp/evil.md", "prefix:cp"),
+        ("cat ~/.gan-zhong-xue/map.md | tee ~/.gan-zhong-xue/map.jsonl", "prefix:tee"),
+        ("rm ~/.gan-zhong-xue/map.md", "prefix:rm"),
         ("[ -s ~/.gan-zhong-xue/pending.md ]", "prefix:["),
         ("test -s ~/.gan-zhong-xue/pending.md", "prefix:test"),
+        ("GZX_APP=~/.gan-zhong-xue/gzx-append.sh", "prefix:gzx-append.sh"),
+        ("sed -i s/a/b/ ~/.gan-zhong-xue/map.md", "sed"),
+        ("perl -i -pe s/a/b/ ~/.gan-zhong-xue/map.md", "perl"),
+        ("python3 -c \"open('~/.gan-zhong-xue/map.md','w')\"", "prefix:python3"),
+        ("echo hi > /tmp/out ~/.gan-zhong-xue/map.md", "prefix:echo"),
+        # ── 结构层 ──
+        ("~/.gan-zhong-xue/gzx-append.sh map <<'E'\nx\nE\nrm ~/.gan-zhong-xue/map.md",
+         "structure"),
         ("if [ -s ~/.gan-zhong-xue/map.jsonl ]; then cat ~/.gan-zhong-xue/map.jsonl; fi",
          "structure"),
-        ("GZX_APP=~/.gan-zhong-xue/gzx-append.sh", "prefix:gzx-append.sh"),
         ("mkdir -p ~/.gan-zhong-xue && chmod 700 ~/.gan-zhong-xue", "structure"),
         ("~/.gan-zhong-xue/gzx-append.sh map <<EOF\n$(echo pwn)\nEOF", "structure"),
-        ("~/.gan-zhong-xue/gzx-append.sh map <<'E'\nhello\nE\nrm ~/.gan-zhong-xue/map.md\nE",
-         "heredoc:delim_repeats"),
         ("~/.gan-zhong-xue/gzx-append.sh map <<-'E'\nx\nE", "structure"),
         ("~/.gan-zhong-xue/gzx-append.sh map <<'A' <<'B'\nx\nA", "structure"),
+        ("cat ~/.gan-zhong-xue/map.md && python3 -c \"open('m','w')\"", "structure"),
+        ("cat ~/.gan-zhong-xue/map.md; rm ~/.gan-zhong-xue/map.md", "structure"),
+        ("cat ~/.gan-zhong-xue/map.md\nrm ~/.gan-zhong-xue/map.md", "structure"),
+        ("cat ~/.gan-zhong-xue/map.md #c\nrm ~/.gan-zhong-xue/map.md", "structure"),
+        ("cat ~/.gan-zhong-xue/map.md & python3 -c \"open('m','w')\"", "structure"),
+        ("find ~/.gan-zhong-xue -name map.md -execdir rm {} \\;", "find:-execdir"),
+        ("cat ~/.gan-zhong-xue/map.md 'oops", "structure"),
+        # 命令替换（含藏在双引号里的形态——以前随引号串漏过只读白名单）
+        ("cat \"`rm ~/.gan-zhong-xue/map.md`\"", "structure:`"),
+        ("cat \"$(rm ~/.gan-zhong-xue/map.md)\"", "structure:$("),
+        ("cat ~/.gan-zhong-xue/map.md | grep \"$(rm ~/.gan-zhong-xue/map.md)\"", "structure:$("),
+        # heredoc 形状（官方 heredoc 例外内的身份层与定界符约束，规则名保持）
+        ("~/.gan-zhong-xue/gzx-append.sh map <<'E'\nhello\nE\nrm ~/.gan-zhong-xue/map.md\nE",
+         "heredoc:delim_repeats"),
+        ("~/.gan-zhong-xue/gzx-append.sh map <<'E'\nE\r\nrm ~/.gan-zhong-xue/map.md\nE",
+         "heredoc:delim_repeats"),
+        ("~/.gan-zhong-xue/gzx-append.sh map <<'E'\nE\r\r\nrm ~/.gan-zhong-xue/map.md\nE",
+         "heredoc:delim_repeats"),
         ("/tmp/evil/gzx-append.sh map <<'E'\n~/.gan-zhong-xue/map.md\nE",
          "heredoc:writer_identity"),
         ("./gzx-append.sh map <<'E'\n~/.gan-zhong-xue/map.md\nE",
          "heredoc:writer_identity"),
         ("python3 /tmp/evil/gzx_cli.py save-cell <<'E'\n~/.gan-zhong-xue/map.md\nE",
          "heredoc:cli_identity"),
-        # #128 A 组红线：臂③ heredoc 假写入器/假 CLI（规则名不变）+ $ 劈裂（规则名
-        # 按 #129 共识归入字面性闸，grok #3059 下一刀1「给独立 rule 名」）
         ("/tmp/evil/gzx-append.sh map <<'E'\nhello\nE", "heredoc:writer_identity"),
         ("python3 /tmp/evil/gzx_cli.py save-cell <<'E'\nhello\nE", "heredoc:cli_identity"),
-        ("cat x > $HOME/.gan-zhong-xue/map.jsonl", "expansion:unprovable"),
-        ("cat x >$HOME/.gan-zhong-xue/map.jsonl", "expansion:unprovable"),
+        ("bash ~/.gan-zhong-xue/gzx-append.sh map <<'E'\n## x\nE", "structure:heredoc"),
+        # ── 重定向到数据目录 ──
+        ("cat > ~/.gan-zhong-xue/map.md <<'E'\nx\nE", "redirect"),
         ("cat x > ~/.GAN-ZHONG-XUE/map.jsonl", "redirect-to-protected"),
         ("cat x > /c/Users/foo/.gan-zhong-xue/map.jsonl", "redirect-to-protected"),
-        ("~/.gan-zhong-xue/gzx-append.sh map <<'E'\nE\r\nrm ~/.gan-zhong-xue/map.md\nE",
-         "heredoc:delim_repeats"),
-        ("~/.gan-zhong-xue/gzx-append.sh map <<'E'\nE\r\r\nrm ~/.gan-zhong-xue/map.md\nE",
-         "heredoc:delim_repeats"),
         ("cat x > ~/.gan-zhong-xue/map.jsonl", "redirect"),
-        ("cp ~/.gan-zhong-xue/map.md /tmp/evil.md", "prefix:cp"),
         ("cat ~/.gan-zhong-xue/map.md > ~/.gan-zhong-xue/map.jsonl", "redirect"),
-        ("sed -i s/a/b/ ~/.gan-zhong-xue/map.md", "sed"),
-        ("cat ~/.gan-zhong-xue/map.md | tee ~/.gan-zhong-xue/map.jsonl", "prefix:tee"),
-        ("cat ~/.gan-zhong-xue/map.md && python3 -c \"open('m','w')\"", "structure"),
-        ("cat ~/.gan-zhong-xue/map.md; rm ~/.gan-zhong-xue/map.md", "structure"),
         ("cat ~/.gan-zhong-xue/map.md>~/.gan-zhong-xue/map.jsonl", "redirect"),
         ("cat ~/.gan-zhong-xue/map.md >| ~/.gan-zhong-xue/map.jsonl", "redirect"),
         ("cat ~/.gan-zhong-xue/map.md &> ~/.gan-zhong-xue/map.jsonl", "redirect"),
-        ("cat ~/.gan-zhong-xue/map.md\nrm ~/.gan-zhong-xue/map.md", "structure"),
-        ("cat ~/.gan-zhong-xue/map.md #c\nrm ~/.gan-zhong-xue/map.md", "structure"),
-        ("cat ~/.gan-zhong-xue/map.md & python3 -c \"open('m','w')\"", "structure"),
+        ("cat map.md | gzx-append map > ~/.gan-zhong-xue/map.md", "identity:gzx-append"),
+        ("cat x >~/.gan-zhong-xue/map.md", "redirect-to-protected"),
+        ("cat x >>~/.gan-zhong-xue/map.md", "redirect-to-protected"),
+        ("cat x 2>~/.gan-zhong-xue/err.log", "redirect-to-protected"),
+        ("cat x &>>~/.gan-zhong-xue/map.md", "redirect-to-protected"),
         ("find ~/.gan-zhong-xue -name map.md -fprint ~/.gan-zhong-xue/map.md", "find"),
         ("find ~/.gan-zhong-xue -name map.md -delete", "find"),
-        ("find ~/.gan-zhong-xue -name map.md -execdir rm {} \\;", "structure"),
-        ("python3 -c \"open('~/.gan-zhong-xue/map.md','w')\"", "prefix:python3"),
-        ("rm ~/.gan-zhong-xue/map.md", "prefix:rm"),
-        ("perl -i -pe s/a/b/ ~/.gan-zhong-xue/map.md", "perl"),
-        ("cat map.md | gzx-append map > ~/.gan-zhong-xue/map.md", "redirect"),
-        ("cat ~/.gan-zhong-xue/map.md 'oops", "structure"),
-        # ── #129 三族收敛（dsh #3055 §1/§6、#3061 §2、grok #3054/#3059、pi #3058 §B、
-        #    Bugbot 4722010420/4722010427）——判据=「目标/命令名没有扩展算子」──
-        # 动态目标族：$ 变量 / ${} / 命令替换 / 字面前缀+$ 漏拼 / 反引号 / 引号内变量
+        # ── 字面性闸：动态目标 / 通配符 / 引号转义拼接 / 身份位 ──
+        ("cat x > $HOME/.gan-zhong-xue/map.jsonl", "expansion:unprovable"),
+        ("cat x >$HOME/.gan-zhong-xue/map.jsonl", "expansion:unprovable"),
         ("cat x > $VAR", "expansion:unprovable"),
         ("cat x >$VAR", "expansion:unprovable"),
         ("cat x > ${HOME}/.gan-zhong-xue/map.jsonl", "expansion:unprovable"),
@@ -1024,52 +1207,44 @@ def selftest():
         ("cat x > \"$OUT\"", "expansion:unprovable"),
         ("cat x > '$OUT'", "expansion:unprovable"),
         ("cat x > out$N.log", "expansion:unprovable"),
-        # 通配符族（dsh #3061 §2：(a) 范围外逃逸 (b) 已进范围但目标按字面判）
+        ("cat x > cache-[abc].log", "expansion:unprovable"),
         ("cat x > ~/.gan-zhong-*/map.jsonl", "expansion:unprovable"),
         ("cat ~/.gan-zhong-xue/map.md > ~/.gan-zhong-*/map.jsonl", "expansion:unprovable"),
         ("cat x > ~/.gan-zhong-x?e/map.jsonl", "expansion:unprovable"),
         ("cat x > ~/.gan-zhong-xu[e]/map.jsonl", "expansion:unprovable"),
-        # 引号/转义拼接族（dsh #3055 §1）：分词引号消除后真实词元含标记 → 范围门命中
+        ("cat x > $'/home/u/.gan-zhong-xue/map.jsonl'", "expansion:unprovable"),
         ("cat x > ~/.gan-zhong-\"\"xue/map.jsonl", "redirect-to-protected"),
         ("cat x > ~/.gan-zhong-xu\\e/map.jsonl", "redirect-to-protected"),
-        # 非 heredoc 假写入器 / 假 CLI（名字臂执行位，pi #3058 §B-2/B-3、grok #3059 A-3）
-        ("python3 /tmp/evil/gzx_cli.py save-cell", "prefix:python3"),
-        ("python3 -u /tmp/evil/gzx_cli.py save-cell", "prefix:python3"),
-        ("/tmp/evil/gzx-append.sh map", "prefix:gzx-append.sh"),
-        ("sh /tmp/evil/gzx-append.sh map", "prefix:sh"),
-        ("bash -x /tmp/evil/gzx-append.sh map", "prefix:bash"),
-        ("gzx-append.sh map", "prefix:gzx-append.sh"),
-        ("bash gzx-append.sh map", "prefix:bash", "writer-not-on-path"),
-        # heredoc 包装器 / 无引号定界符形态到不了身份层 → 剥离后进身份层被拒
-        ("bash gzx-append.sh map <<E\nhello\nE", "prefix:bash", "writer-not-on-path"),
-        ("bash /tmp/evil/gzx-append.sh map <<'E'\nhello\nE", "prefix:bash"),
-        # 引号参数漏报族（claude #3065 §2）：含空格的引号参数粘进命令头词后
-        # 名字臂失明——quoted 词元两侧自定界断词 + 名字组件匹配 + 邻接吸收拒
-        ("bash \"fake gzx-append.sh\" map", "prefix:bash"),
-        ("python3 \"fake gzx_cli.py\" save-cell", "prefix:python3"),
-        ("bash\"fake gzx-append.sh\"map", "expansion:unprovable"),
-        ("bash\"fake gzx_cli.py\"save-cell", "expansion:unprovable"),
-        # 邻接引号 + 名字子串的 echo 形态也拒（fail-closed；`echo see gzx-append`
-        # 带空格形态保持放行）：
-        ("echo\"see gzx-append\"", "expansion:unprovable"),
-        # grok #3069 §2 验收行：选项+引号值+脚本位被词重建粘合的形态走 raw token 判
-        ("bash --rcfile \"a b\" gzx-append.sh", "prefix:bash"),
-        ("python3 -X \"pycache_prefix=/tmp/a b\" /tmp/evil/gzx_cli.py save-cell", "prefix:python3"),
-        ("bash --rcfile /dev/null gzx-append.sh", "prefix:bash"),
-        ("python3 -X pycache_prefix=/tmp/ab /tmp/evil/gzx_cli.py save-cell", "prefix:python3"),
-        # 身份位扩展算子（dsh #3061 §2 身份位同病）
+        ("cat x > ~/.gan-zhong-'xue'/map.jsonl", "redirect-to-protected"),
+        ("cat > $F <<'EOF'\nx\nEOF", "expansion:unprovable"),
         ("$SCRIPT map", "expansion:unprovable"),
         ("\"$PY\" /tmp/evil/gzx_cli.py save-cell", "expansion:unprovable"),
         ("bash $SCRIPT map", "expansion:unprovable"),
         ("bash gzx_*.sh map", "expansion:unprovable"),
         ("bash gzx-app*.sh map", "expansion:unprovable"),
         ("python3 /tmp/gzx_cl?.py save-cell", "expansion:unprovable"),
+        ("bash$WR map", "expansion:unprovable"),
+        ("echo$HOME", "expansion:unprovable"),
+        ("$EDITOR file.txt", "expansion:unprovable"),
+        # ── 已申报代价（拒绝方向；README「已知代价」逐条对应）──
+        ("python3 -m py_compile /tmp/evil/gzx_cli.py", "identity:gzx_cli.py"),
+        ("python3 tool.py gzx_cli.py", "identity:gzx_cli.py"),
+        ("sudo cp /tmp/evil/gzx_cli.py /tmp/x", "identity:gzx_cli.py"),
+        ("env X=$Y python3 hooks/check.py /tmp/evil/gzx_cli.py", "identity:gzx_cli.py"),
+        ("command -v gzx-append.sh", "identity:gzx-append.sh"),
+        # 参数位的裸名（启动器包着的直调也一样）：请写路径
+        ("env gzx-append.sh map", "identity:gzx-append.sh"),
+        ("sudo -n gzx-append.sh map", "identity:gzx-append.sh"),
+        ("timeout 5 gzx-append.sh map", "identity:gzx-append.sh"),
+        ("source gzx-append.sh map", "identity:gzx-append.sh"),
+        (". gzx-append.sh map", "identity:gzx-append.sh"),
+        ("bash <<< 'gzx-append.sh'", "identity:gzx-append.sh"),
     ]
     # 环境条件（dsh #3055 §3：裸名用例按「安装态是否存在」条件生效；跳过显式打印
     # 且留在分母里，不伪造 PASS——#128 C3「跳过不得表现为通过」的守卫侧同款）
     conds = {
-        "writer-on-path": lambda: _is_writer_token(WRITER_MARK),
-        "writer-not-on-path": lambda: not _is_writer_token(WRITER_MARK + ".sh"),
+        "writer-on-path": lambda: _head_is_official(WRITER_MARK),
+        "writer-not-on-path": lambda: not _head_is_official(WRITER_MARK + ".sh"),
     }
     fails = []
     skipped = []
