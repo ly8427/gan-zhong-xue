@@ -1,26 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""gzx-capture.py — 提交静默捕获 hook（v1.1.2，board thread #80 C' 定案 + GPT
-PR #4 审查 P1-5 收口）。
+"""gzx-capture.py — 提交静默捕获 hook（v1.2.0，支持 root-commit / detached HEAD / -C 与 cd 上下文）。
 
 定位：零打扰。PostToolUse 命中 git commit 时，不向用户说任何话，只往
 ~/.gan-zhong-xue/candidates.jsonl 追加一条 {sha, add, del, event, seq, ts}。
-提醒只在下次 skill 被唤起时由第 -1 步兑现（"上次有 N 个提交没挖"）。
-
-隐私（D1）：不写文件路径、不写仓库名——只有 sha 与增删行数。
-
-v1.1.0（GPT PR #4 审查收口）：
-  * P1-4：去重检查/序号计算/追加移入写入器核心的同一临界区
-    （lock_append_commit_unique）——并发不再重复登记或序号错乱。
-  * P1-5：commit 命令失败时不得捕获旧 HEAD——git commit 失败的方式远不止
-    "nothing to commit"（钩子拒绝、合并冲突、消息编辑器中止…），一律以
-    「工具输出中是否存在 git commit 的成功标记 `[分支名 <sha>]`」为准：
-    提取不到该标记 → 不捕获；提取到 → 再与 rev-parse HEAD 复核一致才落账。
-  * 残余如实：输出被宿主截断导致成功标记丢失 → 漏捕获（漏报可由用户在
-    唤起时口头补挖，不产生错误记录——漏报优于误报）。
-
-协议：stdin = 宿主 PostToolUse JSON；任何异常静默退出 0（捕获是旁路，绝不
-阻塞工作流）。
 """
 
 import json
@@ -37,12 +20,14 @@ CANDIDATES = os.path.join(GZX_DIR, "candidates.jsonl")
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "..", "skills", "gan-zhong-xue"))
 try:
-    from gzx_lock_append import lock_append_commit_unique  # 写入器核心（唯一实现）
+    from gzx_lock_append import lock_append_commit_unique, _normalize_dir
 except ImportError:
     lock_append_commit_unique = None
+    _normalize_dir = None
 
-# git commit 成功输出的标记：[分支名 <sha>]（GPT round-18 P1-5）
-_COMMIT_OK_RE = re.compile(r"\[[\w./-]+ +([0-9a-f]{7,40})\]")
+# git commit 成功输出标记：支持 [main abc1234]、[main (root-commit) abc1234]、
+# [detached HEAD abc1234] 等形态。
+_COMMIT_OK_RE = re.compile(r"\[[^\]]+\s+([0-9a-f]{7,40})\]")
 
 
 def _core_path():
@@ -51,41 +36,55 @@ def _core_path():
     return cand if os.path.exists(cand) else os.path.join(GZX_DIR, "gzx_lock_append.py")
 
 
+def _extract_committed_shas(text):
+    """提取 commit 输出中所有成功标记里的 sha 候选列表。"""
+    return [m.group(1) for m in _COMMIT_OK_RE.finditer(text or "")]
+
+
 def _extract_committed_sha(text):
-    """从 commit 命令输出提取成功标记里的 sha；无标记 = 提交未成功 → None。"""
-    m = _COMMIT_OK_RE.search(text or "")
-    return m.group(1) if m else None
+    """兼容旧接口：返回首个成功标记里的 sha；无标记 → None。"""
+    shas = _extract_committed_shas(text)
+    return shas[0] if shas else None
 
 
-# 环境前缀赋值：NAME=value（出现在命令首部时是设置环境变量，不是要执行的命令）
 _ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-# 结构分隔符：命令链/管道/后台/换行/子 shell——它们切出「一条简单命令」的边界
 _CMD_SEPARATORS = {"&&", "||", "|", "|&", ";", ";;", "&", "\n", "(", ")", "{", "}"}
-# shell 保留字：它们自己不是要执行的程序，出现即开启一个新的命令段
-#   （`if true; then git commit; fi`——then 之后的 git 才是命令首词）
 _SHELL_RESERVED = {"if", "then", "else", "elif", "fi", "for", "while", "until", "do",
                    "done", "case", "esac", "in", "function", "time", "!", "{", "}",
                    "[[", "]]", "coproc", "select"}
-# 重定向算子（下一词是目标文件——与本层无关，算子本身丢弃，目标词留着无害）
 _REDIRECT_OPS = {">", ">>", "<", ">|", "<&", ">&", "&>", "&>>", "<>"}
-# 全部边界词：分隔符 ∪ 保留字 ∪ 重定向算子——「冒号接回」不得跨越它们
 _ALL_BOUNDARIES = _CMD_SEPARATORS | _SHELL_RESERVED | _REDIRECT_OPS
+_PUNCT_SET = set("();<>|&\n")
+# 全标点粘连词元的拆分表：已知复合操作符最长匹配，其余拆单字符。
+# `);` 粘连是 punctuation_chars 把连续标点并成单 token 的第三次现形
+# （grok #3054/#3059、dsh #3055 §5-4）：`( cd x && git commit ); git commit`
+# 的外层 commit 因 `);` 不在分隔符集而漏捕获。
+_GLUED_COMPOUND = ("&&", "||", "|&", "&>>", "&>", ">>", ">|", "<>", ">&",
+                   "<<<", "<<", ";;")
+
+
+def _split_glued_punct(tok):
+    """全标点词元 → 复合操作符最长匹配 + 单字符；含非标点字符的词元原样返回。"""
+    if tok in _ALL_BOUNDARIES:
+        return [tok]
+    if not tok or any(c not in _PUNCT_SET for c in tok):
+        return [tok]
+    out = []
+    i = 0
+    while i < len(tok):
+        for op in _GLUED_COMPOUND:
+            if tok.startswith(op, i):
+                out.append(op)
+                i += len(op)
+                break
+        else:
+            out.append(tok[i])
+            i += 1
+    return out
 
 
 def _lex(cmd):
-    """shell 切词（posix：引号内不外泄成结构符），并把 shlex 切开的冒号接回去。
-
-    shlex 一旦启用 punctuation_chars，**任何冒号都被切成独立词元**（Python 文档
-    明载：为支持 Windows 路径而如此设计）——实测 `git -C C:/r commit` 被切成
-    ['git','-C','C',':','/r','commit']，`-C` 把 'C' 当成了路径值。
-    后处理：一个独立的 `:` 词元，若它**不是段首**（前一词存在且不是边界符）且
-    **后一词存在且不是边界符**，视为同一个词被切碎 ⇒ 前后接回。
-    段首的 `:`（shell 的 no-op 内建命令，如 `: && git commit`）不接回。
-    v1.1.2（Bugbot 4670188696）：`$` 不在 shlex 默认词字符表里，**永远被切成独立
-    词元**——`PATH=$PATH:/x` 被切成 ['PATH=','$','PATH:/x']，环境赋值跳过匹配不到
-    ⇒ 漏掉真提交。修法=把 `$` 加进 wordchars（`$VAR`、`$$`、`$(…` 保持完整词元；
-    `$(` 的 `(` 仍是边界符，命令替换形态不受影响）。
-    不可解析（引号未闭合等）→ 返回 None（漏报优于误报，与 P1-5 同向）。"""
+    """shell 切词（posix：引号内不外泄成结构符），并接回被切开的冒号。"""
     try:
         lex = shlex.shlex(cmd, posix=True, punctuation_chars="();<>|&\n")
         lex.whitespace_split = False
@@ -95,7 +94,6 @@ def _lex(cmd):
         raw = list(lex)
     except ValueError:
         return None
-    # 冒号接回（见上）
     merged = []
     i = 0
     n = len(raw)
@@ -108,44 +106,45 @@ def _lex(cmd):
             continue
         merged.append(tok)
         i += 1
-    return merged
+    final = []
+    for tok in merged:
+        final.extend(_split_glued_punct(tok))
+    return final
 
 
-def _iter_simple_commands(cmd):
-    """把一条 shell 命令串切成「简单命令」的词元列表（生成器）。
-
-    v1.1.2（GPT 外审十轮 P2-1）：捕获判定不能只看整串的开头——`cd X && git commit`、
-    `/usr/bin/git commit`、`env A=b git commit` 都是真实提交却会被旧判定漏掉。
-    用 _lex 切词，按结构分隔符与 shell 保留字切段；不可解析 → 不产出任何命令。
-
-    已知不识别的形态（如实登记，漏报方向）：`sudo git commit`、`docker exec … git commit`
-    ——包装器后面的命令，cwd 与输出归属不可信；`xargs`/`find -exec` 间接提交。
-    识别为「是 commit 动作」但不会产生提交的形态（如 `git commit --help`）不在本层
-    排除：是否真有提交由后道防线把关（输出须有成功标记且与 HEAD 复核一致，P1-5）。"""
+def _iter_simple_commands_with_seps(cmd):
+    """产出 (subshell_depth, sep_before, seg)，用于跟踪 cd 与子 shell 边界。
+    注意：( ) 建立子 shell 隔离；{ } 是当前 shell 复合命令分组，不产生子 shell。"""
     tokens = _lex(cmd or "")
     if tokens is None:
         return
     seg = []
+    subshell_depth = 0
+    sep_before = ""
     for tok in tokens:
         if tok in _REDIRECT_OPS:
-            continue                           # 重定向符本身：跳过（目标词留在段内无害）
+            continue
         if tok in _CMD_SEPARATORS or tok in _SHELL_RESERVED:
             if seg:
-                yield seg
-            seg = []
+                yield subshell_depth, sep_before, seg
+                seg = []
+            if tok == "(":
+                subshell_depth += 1
+            elif tok == ")":
+                subshell_depth = max(0, subshell_depth - 1)
+            sep_before = tok
             continue
         seg.append(tok)
     if seg:
+        yield subshell_depth, sep_before, seg
+
+
+def _iter_simple_commands(cmd):
+    """把一条 shell 命令串切成「简单命令」的词元列表（生成器）。"""
+    for _, _, seg in _iter_simple_commands_with_seps(cmd):
         yield seg
 
 
-# git 全局选项（权威=`git --help` 用法行；写在子命令 <command> 之前）。
-#   分开写、下一个词是值：-C <path>、-c <name>=<value>
-#   分开写或内联值：      --exec-path[=<path>]、--git-dir=<path>、--work-tree=<path>、
-#                        --namespace=<name>、--config-env=<name>=<envvar>
-#   无值旗标：            -v --version -h --help -p --paginate -P --no-pager
-#                        --no-replace-objects --no-lazy-fetch --no-optional-locks
-#                        --no-advice --bare
 _GIT_GLOBAL_WITH_ARG = {"-C", "-c"}
 _GIT_GLOBAL_OPTIONAL_VAL = {"--exec-path", "--git-dir", "--work-tree", "--namespace",
                             "--config-env"}
@@ -155,40 +154,25 @@ _GIT_GLOBAL_FLAGS = {"-v", "--version", "-h", "--help", "-p", "--paginate", "-P"
 
 
 def _skip_git_globals(seg, i):
-    """从 seg[i] 起跳过 git 的全局选项，返回子命令词的下标（到头则返回 len）。
-
-    判据全部对齐 `git --help` 用法行（v1.1.2 GPT 外审十轮 P2-1）：只认清单内的
-    全局选项，清单外的词一律视为子命令——不做「像旗标就跳过」的模糊判断。"""
     n = len(seg)
     while i < n:
         w = seg[i]
         if w in _GIT_GLOBAL_WITH_ARG:
-            i += 2                              # 短选项，值是下一个词
+            i += 2
         elif w.split("=", 1)[0] in _GIT_GLOBAL_OPTIONAL_VAL:
-            # 值可内联也可分开：内联（词里带 '='）则本词自足；分开写则值是下一个词
             i += 2 if "=" not in w else 1
         elif w in _GIT_GLOBAL_FLAGS:
             i += 1
         else:
-            break                               # 不在清单内 ⇒ 这就是子命令
+            break
     return i
 
 
-def _is_git_commit_segment(seg):
-    """一个简单命令段是否为 `git commit`（允许 env 赋值前缀、env 命令包装、git 全局选项）。"""
+def _strip_env_prefix(seg):
+    """跳过前置 VAR=val 和 env 包装，返回实际程序词下标（或 >= len(seg)）。"""
     i = 0
-    # 跳过前置环境赋值：FOO=bar git commit …
     while i < len(seg) and _ENV_ASSIGN_RE.match(seg[i]):
         i += 1
-    # env 包装：env [选项/VAR=x …] git commit …
-    # v1.1.2（GPT 外审十一轮 P2）：env 的选项分「无参」与「带参」两类，旧循环把
-    # 所有 - 开头的词都当无参跳过 ⇒ `env -u HTTP_PROXY git commit` 在 -u 后停在
-    # 变量名上（把变量名当程序名）⇒ 真提交漏捕获。带参选项的值是下一个词。
-    #   无参：-i --ignore-environment -0 --null -v --verbose
-    #         --block-signal --default-signal --ignore-signal（=值内联或省略）
-    #   带参：-u/--unset、-C/--chdir、-S/--split-string（下一个词是值）
-    #   内联值（--unset=X 等）：一个词自足
-    #   `--`：其后全是位置参数（程序+参数），env 部分结束
     if i < len(seg) and seg[i].rsplit("/", 1)[-1] == "env":
         i += 1
         n = len(seg)
@@ -198,25 +182,25 @@ def _is_git_commit_segment(seg):
                 i += 1
                 break
             if w in ("-u", "--unset", "-C", "--chdir", "-S", "--split-string"):
-                i += 2                          # 带值选项：值是下一个词
+                i += 2
             elif w in ("-i", "--ignore-environment", "-0", "--null", "-v", "--debug",
                        "-", "--list-signal-handling",
                        "--block-signal", "--default-signal", "--ignore-signal"):
-                # v1.1.2（Bugbot 4674364435）：-v 的长选项是 --debug 不是 --verbose
-                # （对齐 `env --help`）；`-` 单独出现等价于 -i（env --help 明载）；
-                # --list-signal-handling 是无参旗标（此前漏登记）。
-                i += 1                          # 无参旗标
+                i += 1
             elif w.startswith("--") and "=" in w:
-                i += 1                          # 内联值：--unset=X 等
+                i += 1
             elif _ENV_ASSIGN_RE.match(w):
-                i += 1                          # env 的 VAR=value 参数
+                i += 1
             else:
-                break                           # 不再是 env 的参数 ⇒ 这是程序名
+                break
+    return i
+
+
+def _is_git_commit_segment(seg):
+    """一个简单命令段是否为 `git commit`。"""
+    i = _strip_env_prefix(seg)
     if i >= len(seg):
         return False
-    # 程序名识别（v1.1.2 Bugbot 4670188716）：basename 恰为 git 或 git.exe
-    # （Windows 可执行文件名带 .exe；大小写不敏感——Windows 文件名不区分大小写）。
-    # 旧判定 startswith("git") 能识别 git.exe，本层不得回退。
     git_prog = seg[i].rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
     if git_prog not in ("git", "git.exe"):
         return False
@@ -225,12 +209,108 @@ def _is_git_commit_segment(seg):
 
 
 def is_commit_command(cmd):
-    """命令串里是否**执行**了 git commit（v1.1.2 GPT 外审十轮 P2-1）。"""
+    """命令串里是否执行了 git commit。"""
     return any(_is_git_commit_segment(seg) for seg in _iter_simple_commands(cmd or ""))
 
 
+def _resolve_dir(base, target):
+    p = os.path.expanduser(target)
+    if _normalize_dir is not None:
+        p = _normalize_dir(p)
+    if not os.path.isabs(p) and base:
+        p = os.path.join(base, p)
+    return os.path.normpath(p)
+
+
+def _extract_git_contexts(cmd, initial_cwd):
+    """追踪命令行中的 cd / env -C / git -C / --git-dir / --work-tree，
+    返回每个 git commit 命中的上下文列表 [(cwd, git_dir, work_tree), ...]。
+    支持当前 shell 大括号分组 { cd repo; git commit; } 与子 shell 栈隔离 ( cd repo && git commit )。
+    已知残余漏报：变量目标 cd（目标含 $）与 cd - 暂不追踪，在 docs/mechanism.md 如实记录。"""
+    cur_cwd = initial_cwd
+    if cur_cwd and _normalize_dir is not None:
+        cur_cwd = _normalize_dir(cur_cwd)
+    contexts = []
+    cwd_stack = []
+    curr_depth = 0
+    for depth, sep_before, seg in _iter_simple_commands_with_seps(cmd or ""):
+        if depth > curr_depth:
+            for _ in range(depth - curr_depth):
+                cwd_stack.append(cur_cwd)
+            curr_depth = depth
+        elif depth < curr_depth:
+            for _ in range(curr_depth - depth):
+                if cwd_stack:
+                    cur_cwd = cwd_stack.pop()
+            curr_depth = depth
+
+        # 管道右侧的 cd 属于子进程不影响外层；其余（包括顶层、花括号分组、子 shell 内部）均更新当前上下文
+        if sep_before not in ("|", "|&") and seg and seg[0] == "cd":
+            args = [a for a in seg[1:] if a != "--" and not a.startswith("-")]
+            if args and args[0] != "-" and "$" not in args[0]:
+                cur_cwd = _resolve_dir(cur_cwd, args[0])
+            continue
+        if not _is_git_commit_segment(seg):
+            continue
+        eff_cwd = cur_cwd
+        # 也支持 env -C <dir>
+        j = 0
+        while j < len(seg) and _ENV_ASSIGN_RE.match(seg[j]):
+            j += 1
+        if j < len(seg) and seg[j].rsplit("/", 1)[-1] == "env":
+            k = j + 1
+            while k < len(seg):
+                w = seg[k]
+                if w == "--":
+                    break
+                if w in ("-C", "--chdir") and k + 1 < len(seg):
+                    eff_cwd = _resolve_dir(eff_cwd, seg[k + 1])
+                    k += 2
+                elif (w.startswith("--chdir=") or w.startswith("-C=")):
+                    eff_cwd = _resolve_dir(eff_cwd, w.split("=", 1)[1])
+                    k += 1
+                elif w in ("-u", "--unset", "-S", "--split-string"):
+                    k += 2
+                elif w in ("-i", "--ignore-environment", "-0", "--null", "-v", "--debug",
+                           "-", "--list-signal-handling",
+                           "--block-signal", "--default-signal", "--ignore-signal") or (
+                        w.startswith("--") and "=" in w) or _ENV_ASSIGN_RE.match(w):
+                    k += 1
+                else:
+                    break
+        git_idx = _strip_env_prefix(seg) + 1
+        git_dir = None
+        work_tree = None
+        while git_idx < len(seg):
+            w = seg[git_idx]
+            if w == "-C" and git_idx + 1 < len(seg):
+                eff_cwd = _resolve_dir(eff_cwd, seg[git_idx + 1])
+                git_idx += 2
+            elif w == "-c":
+                git_idx += 2
+            elif w == "--git-dir" and git_idx + 1 < len(seg):
+                git_dir = _resolve_dir(eff_cwd, seg[git_idx + 1])
+                git_idx += 2
+            elif w.startswith("--git-dir="):
+                git_dir = _resolve_dir(eff_cwd, w.split("=", 1)[1])
+                git_idx += 1
+            elif w == "--work-tree" and git_idx + 1 < len(seg):
+                work_tree = _resolve_dir(eff_cwd, seg[git_idx + 1])
+                git_idx += 2
+            elif w.startswith("--work-tree="):
+                work_tree = _resolve_dir(eff_cwd, w.split("=", 1)[1])
+                git_idx += 1
+            elif w.split("=", 1)[0] in _GIT_GLOBAL_OPTIONAL_VAL:
+                git_idx += 2 if "=" not in w else 1
+            elif w in _GIT_GLOBAL_FLAGS:
+                git_idx += 1
+            else:
+                break
+        contexts.append((eff_cwd, git_dir, work_tree))
+    return contexts
+
+
 def _already_captured(sha):
-    """D5 去重键 (sha, event) 的读面快查（真正的原子去重在写入器核心锁内）。"""
     try:
         with open(CANDIDATES, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -248,8 +328,6 @@ def _already_captured(sha):
     return False
 
 
-
-
 def _dbg(msg):
     if os.environ.get("RG_CAPTURE_DEBUG"):
         try:
@@ -259,6 +337,7 @@ def _dbg(msg):
         except Exception:
             pass
 
+
 def main():
     try:
         raw = sys.stdin.read()
@@ -266,39 +345,48 @@ def main():
         ti = event.get("tool_input", {}) or {}
         cmd = (ti.get("command") or "").strip()
 
-        # 只捕获真正执行了 git commit 的命令（其他 Bash 调用无关）。
-        # v1.1.2（GPT 外审十轮 P2-1）：按简单命令段识别——支持 `cd X && git commit`、
-        # `/usr/bin/git commit`、`env A=b git commit`；引号里的 commit、非 git 命令的
-        # commit 参数不算（见 is_commit_command）。
         if not is_commit_command(cmd):
             _dbg("skip: not git commit")
             return
         resp_text = json.dumps(event.get("tool_response", {}), ensure_ascii=False)
 
-        # P1-5：提交必须真的成功——输出里要有 [分支 <sha>] 成功标记
-        sha_out = _extract_committed_sha(resp_text)
-        _dbg("marker=%r" % sha_out)
-        if not sha_out:
+        sha_cands = _extract_committed_shas(resp_text)
+        _dbg("markers=%r" % sha_cands)
+        if not sha_cands:
             _dbg("skip: no marker")
             return
 
-        cwd = event.get("cwd") or None
-        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=cwd,
-                              capture_output=True, timeout=15)
-        if head.returncode != 0:
-            _dbg("skip: rev-parse")
+        base_cwd = event.get("cwd") or None
+        contexts = _extract_git_contexts(cmd, base_cwd) or [(base_cwd, None, None)]
+
+        matched = None
+        for eff_cwd, git_dir, work_tree in reversed(contexts):
+            git_base = ["git"]
+            if git_dir:
+                git_base.extend(["--git-dir", git_dir])
+            if work_tree:
+                git_base.extend(["--work-tree", work_tree])
+            head = subprocess.run(git_base + ["rev-parse", "HEAD"], cwd=eff_cwd,
+                                  capture_output=True, timeout=15)
+            if head.returncode != 0:
+                continue
+            sha = head.stdout.decode().strip()
+            if any(sha.startswith(s) or s.startswith(sha[:len(s)]) for s in sha_cands):
+                matched = (sha, git_base, eff_cwd)
+                break
+
+        if matched is None:
+            _dbg("skip: no matching HEAD across contexts")
             return
-        sha = head.stdout.decode().strip()
-        # 复核：输出标记的 sha 与当前 HEAD 一致（防旧 HEAD 误捕获）
-        if not (sha.startswith(sha_out) or sha_out.startswith(sha[:len(sha_out)])):
-            return
+
+        sha, git_base, eff_cwd = matched
         _dbg("dedup-pass")
         if _already_captured(sha):
             _dbg("skip: dup")
             return
 
         numstat = subprocess.run(
-            ["git", "show", "--numstat", "--format=", "HEAD"], cwd=cwd,
+            git_base + ["show", "--numstat", "--format=", "HEAD"], cwd=eff_cwd,
             capture_output=True, timeout=15)
         add = ddel = 0
         for ln in numstat.stdout.decode(errors="replace").splitlines():
@@ -313,20 +401,17 @@ def main():
             "del": ddel,
             "event": "commit",
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        }, ensure_ascii=False)   # seq 由写入器核心在锁内现算(P1-4)
+        }, ensure_ascii=False)
 
         data = (row + "\n").encode()
         _dbg("writer unique=%s" % (lock_append_commit_unique is not None))
         if lock_append_commit_unique is not None:
-            lock_append_commit_unique(GZX_DIR, data)     # 原子去重+序号+追加
+            lock_append_commit_unique(GZX_DIR, data)
         else:
             core = _core_path()
             subprocess.run([sys.executable, core, "candidates"], input=data,
                            capture_output=True, timeout=20)
-    except Exception as _e:
-        # GPT 外审(PR#4 五轮): 默认路径必须真静默(零 stderr、不写 trace 文件)
-        # ——traceback 可能含本机绝对路径,与最小化记录原则不一致;诊断只在
-        # RG_CAPTURE_DEBUG 显式开启时输出(与 _dbg 同一开关)。
+    except Exception:
         if os.environ.get("RG_CAPTURE_DEBUG"):
             try:
                 import traceback as _tb

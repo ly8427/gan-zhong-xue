@@ -1,5 +1,33 @@
 # Changelog
 
+## v1.2.0 — 2026-11-26
+
+**响应 Issue #6（P0/P1/P2 系统性重构与修复）：聚合 CLI 收口确定性逻辑、收窄守卫误杀面、打通跨平台测试与捕获断层、瘦身 `SKILL.md` 并清零 `docs/DEBT.md` 欠账。**
+
+**评审收敛批（2026-11-28，PR #7 复审：board #129 四家增量评审 + Cursor Bugbot 两轮；实现方 zcode）**：
+
+- **守卫重写（`hooks/gzx-guard.py`，board #129 重写计划 v2 + dsh #3072 四条补充）**：此前五轮都是「评审报一条、在某一层加一条规则」，守卫膨胀到三套互相叠加的词分析层、每修一层就在另一层开新洞。重写后不再分析「谁执行谁」（启动器任意嵌套，位置分析无界），判定只问两个能可靠回答的问题——命令名是不是「会启动程序的类型」（shell / 解释器 / 启动器封闭清单）、命令里任何位置有没有出现官方写入器 / CLI 的名字；两条都是则每个出现处的完整路径必须精确等于官方固定位。自带词法底座（一遍扫出词与操作符，带原文位置与引号标记；引号栈区分外层引号与命令替换里另起的引号；冒号、`$`、`[` 不再切词），删除解释器选项表与词重建层。**收口**：dsh #3066 的 17 条启动器探针；Bugbot 五条（Python 选项表 ×3、`.exe` 包装器、冒号切分）；`bash -c` 载荷里的官方名；命令替换里的官方名；藏在双引号里的命令替换；参数位上的裸写入器名（实测 bash / sh 找脚本参数先看当前目录，当前目录里的同名假件会遮住 PATH 上的官方件）；命令自带 `PATH=` 前缀的裸名解析；粘连命令名 `echo$HOME`（DEBT D5 销账）；官方路径当陪衬参数不放行启动器命令块（Bugbot 4728123561 / 4728174715——官方名在固定位只证明它不是假件，不证明被执行的就是官方件）：官方件必须**紧跟启动器链**（链里只有启动器的裸名与字面赋值）才免前缀检查，前面夹着选项、选项值、别的程序或带路径的同名程序都不给豁免——按「能力」判而不按「字符」判，贴在选项上的载荷（`python3 -c'exec(open("/tmp/p").read())' <官方件>`，dsh #3075 §2）同样走不通；清单外执行器补进名单（fakeroot / unshare / flock / taskset / nsenter / runuser / sg / systemd-run / chrt / ionice、py / pythonw / pypy3），find 的每一个 `-exec` / `-execdir` / `-ok` / `-okdir` 段按执行器对待、只查紧跟旗标的那个程序，程序是启动器才查后面的参数，命令里出现可能展开成旗标的词且提到官方名时整段都查（claude #3074 §2、dsh #3075 §3、Bugbot 4728242786）。**同时解除的误伤**：`bash.exe <官方写入器>`、`FOO=bar cat <数据目录文件>`、`env <官方写入器>`、`cmd > out $ARGS`（`$` 在参数上而非写目标上）。**新增代价**（各配一对自检，逐条见 docs/mechanism.md「已知代价与边界」）：解释器 / 启动器命令里出现的官方名必须是官方位，哪怕只是数据参数（`python3 -m py_compile /x/gzx_cli.py` 被拒）；带引号的程序串里出现官方名即拒，包括官方件；参数位的裸写入器名一律拒（合法直调请写路径或用命令名位）；官方件前面不能夹选项（`python3 -W ignore '<官方 CLI>'`、`sudo -n <官方写入器>` 被保守拒，文档里的官方写法都不带选项）；xargs 命令里的官方名一律按被执行处理（`xargs grep -l gzx-append`）。
+- **守卫范围门 token 化 + heredoc 正文剥离**：范围判定从原串字面改为按词（引号拼接 `~/.gan-zhong-""xue` 修复）；非官方 heredoc 剥离正文后进身份层（包装器 / 假写入器形态可达，`unparseable` 默认拒）。
+- **cell 分层歧义（`gzx_cli.py`）**：同概念跨多分层时 `cell <概念>` 报歧义（退出码 25）不静默取格；`cell <概念> <分层>` 按 (概念,分层) 精确取格。
+- **check-divergence 升级重建+diff**：jsonl 行与 md 格按 (概念,分层) 追加序逐位配对、逐字段比对渲染面，字段不符/缺格/孤立格均报（`cell_check` 明细），退出码 24 不变；明细到上限（10 条）后配对继续、`orphan_md_cells` 仍是真实孤立格数，并以 `mismatches_truncated` 如实标记（Bugbot 4727029068）。
+- **capture `);` 粘连拆分（`hooks/gzx-capture.py`）**：全标点粘连词元按复合操作符拆分，`( cd repo && git commit ); git commit` 的外层提交不再漏捕获。
+- **CLI bash 探测同口径**：`gzx_lock_append.find_git_bash()` 共享实现（固定安装位 + MINGW/MSYS 校验），CLI 自检不再可能选中 WSL bash。
+- **测试基建**：两套测试输出强制 UTF-8（Windows CI 运行器 cp1252 控制台打印中文即崩的根因）；D1 测试 python3 改 bash 垫片转调真实解释器（商店版别名桩不可复制）；命令名位的裸名用例按安装态条件生效、跳过显式计（参数位的裸名不再设条件）；新增守卫字面性闸 / heredoc 剥离负例与 capture `);` 端到端例。
+- **行为反例测试（`hooks/test-gzx-behavior.py`，dsh #3066 §4：别再枚举拼写）**：①词法对照表（原文 → 词 / 操作符，含全部历史出洞形态，与 shlex 互证）；②自动生成的攻击矩阵（启动器 × 路径写法 × 引号 × 前缀，4700 余条，含「陪衬官方名」族——官方路径只当参数带上、真正执行的是别的程序）——守卫放行的命令**真跑**，断言诱饵数据目录未被写；官方件不在 PATH / 在 PATH / 假件排在 PATH 最前 / PATH 含当前目录项四种环境逐一真跑（命令名位裸名的安装态由此在两种平台都不再跳过）；另有一组良性命令（同仓开发、find 搜索模式）断言不被误伤；③牙口自证：不带官方名的诱饵脚本必须被检出写入，五种变异（摘掉身份检查 / 启动器清单 / payload 规则 / 陪衬官方名检查 / 字面性闸）下必须变红。把旧头（a689a8c）的守卫放进去跑必红。
+
+- **P0 聚合 CLI 与同锁双写（`skills/gan-zhong-xue/gzx_cli.py` + `gzx_lock_append.py`）**：
+  - 新增 `gzx_cli.py`（`preflight` / `cell` / `save-cell` / `pending-add` / `pending-clear` / `check-divergence`），将第 -1 步多条碎命令压缩为单次 `preflight`，并在单锁 `lock_append_map_pair` 内实现 `map.jsonl` 与 `map.md` 的同锁原子追加与字段/单行校验。
+  - 修复 `lock_append_commit_unique` 漏调 `_normalize_dir(gzx_dir)` 的路径一致性问题。
+- **P0 守卫误杀面收窄（`hooks/gzx-guard.py`）**：
+  - `PROTECTED_MARK` 从泛化 `"gan-zhong-xue"` 收窄为 `.gan-zhong-xue` 与实际 `GZX_DIR`，消除对同仓开发、`git commit` 及不含数据目录引用的 `Agent` 提示词误杀；`Write`/`Edit`/`MultiEdit` 改为判定目标文件路径 `file_path`，避免修改仓内文档被拦。
+  - 放行插件官方 `gzx_cli.py`（含 `save-cell` / `pending-add` heredoc），并修复 `gzx-append.sh` heredoc 路径带引号时无法匹配的问题。
+- **P1 捕获断层与跨平台测试修复**：
+  - `hooks/gzx-capture.py`：`_COMMIT_OK_RE` 支持 `(root-commit)` 与 `detached HEAD`；新增 `_extract_git_contexts` 追踪命令行中的 `cd`、`env -C`、`git -C`、`--git-dir` 与 `--work-tree`，修复 `cwd != 目标仓库` 时的静默漏捕获。
+  - `hooks/test-gzx-integration.py` 与 `hooks/test-gzx-invariants.py`：移除硬编码 Windows Git Bash 路径，Linux/macOS 自动使用系统 `bash`，消除集成测试在 Linux 上的 `FileNotFoundError` 崩溃并激活 Linux 下全部 Bash 写入器测试。
+  - 销账 `docs/DEBT.md` D1（路径 B 放弃 `exec` 改普通调用并清理 `$TMP`）、D2（同锁双写 + `check-divergence`）、D3（引号形态成对正反断言）。
+- **P2 `SKILL.md` 瘦身与分级加载**：
+  - `SKILL.md` 从 ~70KB 精简至精炼运行时指令，掌舵模式走低摩擦快路径；低频分支协议（发牌门 / A/B 岔路 / 复验与 `⏸` 调度）迁至 `skills/gan-zhong-xue/references/branches.md`，冷读模板迁至 `references/subagent-prompt.md`，机制验收与边界论证迁至 `docs/mechanism.md`。
+
 ## v1.1.2 — 2026-11-21
 
 **board #122 r8 修复批次（pi #2737/#2776 第五版定版）+ 用户 PR#4 follow-up（P1/P2）+ Bugbot 两轮五项。**

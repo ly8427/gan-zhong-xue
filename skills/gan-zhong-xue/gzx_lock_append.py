@@ -1,30 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""gzx-lock-append.py — 写入器不变量核心（v1.1.2，board #122 r8 + GPT round-18 收口）。
+"""gzx-lock-append.py — 写入器不变量核心（v1.2.0，单写者锁与 append-only 保障）。
 
 唯一实现"锁 + 追加（append-only 资产）"与"pending 清空（lock_truncate）"的地方：
-gzx-append.sh（bash 面）与 hooks/ 的 python 调用方（gzx-guard / gzx-capture）都落到
-这里，保证两个入口没有第二份不变量实现（无漂移）。
+gzx-append.sh（bash 面）、gzx_cli.py（聚合 CLI）与 hooks/ 的 python 调用方
+都落到这里，保证各入口没有第二份不变量实现（无漂移）。
 
-v1.1.2（board #122 r8，pi #2737/#2776 第五版定版）: 新增 lock_truncate——pending
-唯一清空通道（锁内截断；append-only 资产显式拒绝；存在性检查在锁内）。
-
-用法: python3 gzx-lock-append.py <target>      内容从 stdin 读
+用法: python3 gzx_lock_append.py <target>      内容从 stdin 读
   target ∈ {map|jsonl|pending|candidates|audit}
 退出码: 0 成功（dedup 视为成功跳过）/ 21 目标非法或空 stdin / 23 写失败。
-
-v1.1.0（GPT PR #4 审查收口）:
-  * lock_append 支持 prepend_if_missing——审计 hook_alive 首行的"存在性检查+
-    预置"移入锁内（旧实现两步分离,并发时首行可能重复,P2-7）。
-  * 新增 lock_append_commit_unique——candidates 的 去重检查/序号计算/追加
-    全部在锁内一次完成（旧实现三步分离,并发时重复登记或序号错乱,P1-4）。
 """
 
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
-import time
 
 TARGETS = {
     "map": "map.md",
@@ -33,6 +25,28 @@ TARGETS = {
     "candidates": "candidates.jsonl",
     "audit": "audit.jsonl",
 }
+
+
+def find_git_bash():
+    """跨平台探测可用的 bash（唯一共享实现，CLI 自检与测试套件同口径——
+    grok #3054 A-7：CLI 的 Windows 分支此前 which("bash") 可能选中 WSL bash，
+    与测试套件的避开 WSL 口径不一致）。Windows 上先固定安装位，which 结果须为
+    MINGW/MSYS；POSIX 直接系统 bash。找不到返回 None。"""
+    if os.name != "nt":
+        return shutil.which("bash")
+    for cand in (r"C:\Program Files\Git\bin\bash.exe",
+                 r"C:\Program Files\Git\usr\bin\bash.exe"):
+        if os.path.exists(cand):
+            return cand
+    b = shutil.which("bash")
+    if b:
+        try:
+            r = subprocess.run([b, "-c", "uname -s"], capture_output=True, timeout=15)
+            if b"MINGW" in r.stdout or b"MSYS" in r.stdout:
+                return b
+        except Exception:
+            pass
+    return None
 
 
 def _lock(f):
@@ -49,11 +63,8 @@ def _lock(f):
 
 
 def _normalize_dir(d):
-    """V1.1.0（GPT PR #4 F 组实证）：跨形态目录规范化——POSIX python 收到
-    Windows 盘符路径 / Windows python 收到 /mnt|/c 形态时自动换算。
-    根因：bash 写入器在 Git Bash 里经 cygpath 转 Windows 形态传给 python，
-    但 exec 到的可能是 WSL 的 python3（POSIX）→ 字面量 'C:\\...' 相对目录，
-    数据写到未知位置而 rc=0（静默写错处比写失败更险）。"""
+    """跨形态目录规范化——POSIX python 收到 Windows 盘符路径 / Windows python
+    收到 /mnt|/c 形态时自动换算。"""
     if not d:
         return d
     if os.name == "nt":
@@ -67,15 +78,18 @@ def _normalize_dir(d):
     return d
 
 
+def _to_bytes(data):
+    return data.encode("utf-8") if isinstance(data, str) else data
+
+
 def lock_append(gzx_dir, target, data, prepend_if_missing=None):
     """锁住 gzx_dir/.lock 后追加 data 到对应文件。返回 (rc, message)。
-    只追加：唯一的写模式是 'ab'，代码里不存在截断分支。
-    prepend_if_missing（V1.1.0, P2-7）:目标文件缺失/为空时,先在锁内写入该行
-    （如审计 hook_alive 首行）——存在性检查与预置在同一临界区,并发不重复。"""
+    只追加：唯一的写模式是 'ab'，代码里不存在截断分支。"""
     if target not in TARGETS:
         return 21, "unknown target: %s" % target
     if not data:
         return 21, "empty stdin"
+    raw = _to_bytes(data)
     gzx_dir = _normalize_dir(gzx_dir)
     os.makedirs(gzx_dir, exist_ok=True)
     lockpath = os.path.join(gzx_dir, ".lock")
@@ -88,24 +102,51 @@ def lock_append(gzx_dir, target, data, prepend_if_missing=None):
                     not os.path.exists(targetpath) or os.path.getsize(targetpath) == 0)
                 with open(targetpath, "ab") as f:   # 只追加：'ab'
                     if need_prepend:
-                        f.write(prepend_if_missing.encode("utf-8")
-                                if isinstance(prepend_if_missing, str) else prepend_if_missing)
-                    f.write(data)
+                        f.write(_to_bytes(prepend_if_missing))
+                    f.write(raw)
                     f.flush()
                     os.fsync(f.fileno())
             finally:
                 lf.close()
     except OSError as e:
         return 23, "write failed: %s" % e
-    return 0, "ok %s (+%d bytes)" % (targetpath, len(data))
+    return 0, "ok %s (+%d bytes)" % (targetpath, len(raw))
+
+
+def lock_append_map_pair(gzx_dir, md_data, jsonl_data):
+    """同一把排他锁内依次追加 map.jsonl 与 map.md（D2 双地图互斥写入）。
+    锁提供单写者互斥防护，非跨文件事务原子；jsonl 包含全部元数据字段，
+    如遇写入中断导致发散，可据 jsonl 完好重建 md。"""
+    if not md_data or not jsonl_data:
+        return 21, "empty md or jsonl payload"
+    md_bytes = _to_bytes(md_data)
+    jsonl_bytes = _to_bytes(jsonl_data)
+    gzx_dir = _normalize_dir(gzx_dir)
+    os.makedirs(gzx_dir, exist_ok=True)
+    lockpath = os.path.join(gzx_dir, ".lock")
+    md_path = os.path.join(gzx_dir, TARGETS["map"])
+    jsonl_path = os.path.join(gzx_dir, TARGETS["jsonl"])
+    try:
+        with open(lockpath, "a+") as lf:
+            _lock(lf)
+            try:
+                with open(jsonl_path, "ab") as jf, open(md_path, "ab") as mf:
+                    jf.write(jsonl_bytes)
+                    jf.flush()
+                    os.fsync(jf.fileno())
+                    mf.write(md_bytes)
+                    mf.flush()
+                    os.fsync(mf.fileno())
+            finally:
+                lf.close()
+    except OSError as e:
+        return 23, "write failed: %s" % e
+    return 0, "ok map+jsonl (+%d/+%d bytes)" % (len(md_bytes), len(jsonl_bytes))
 
 
 def lock_append_commit_unique(gzx_dir, data):
-    """V1.1.0（GPT round-18 P1-4）：candidates 提交捕获的原子去重追加。
-    data = 含 sha 与 event 字段的 JSON 行（bytes/str 均可）。
-    锁内一次完成：①查重（同 sha+event 已存在 → 跳过不写,rc=0 标记 dedup-skip）
-    ②序号 = 现有完整行数 + 1（行序单调,不用时间戳——board #49 同秒歧义判例）
-    ③追加。三步同一临界区,并发不再重复/乱序。"""
+    """candidates 提交捕获的原子去重追加。
+    锁内一次完成：查重（sha+event）→ 序号（现有完整行数 + 1）→ 追加。"""
     if isinstance(data, bytes):
         data = data.decode("utf-8", "replace")
     try:
@@ -115,6 +156,7 @@ def lock_append_commit_unique(gzx_dir, data):
     if not isinstance(row, dict) or not row.get("sha"):
         return 21, "data must be a JSON object with sha"
     row.setdefault("event", "commit")
+    gzx_dir = _normalize_dir(gzx_dir)
     os.makedirs(gzx_dir, exist_ok=True)
     lockpath = os.path.join(gzx_dir, ".lock")
     targetpath = os.path.join(gzx_dir, TARGETS["candidates"])
@@ -149,13 +191,7 @@ def lock_append_commit_unique(gzx_dir, data):
 
 
 def lock_truncate(gzx_dir, target):
-    """v1.1.2（Bugbot PR#4 High「pending 无法清空」）：锁内核截断目标文件。
-
-    **只许 pending**——pending 是瞬态待办（SKILL.md：用户明确确认后才清空、
-    只动 pending）；map/jsonl/candidates/audit 是 append-only 资产，
-    截断=破坏不变量，一律拒绝。这是 pending 的**唯一**清空通道：
-    协议不再让模型用 rm/重定向自清（守卫拦 + 绕锁）；flock 快路径之外，
-    全部走本函数（dsh #2754 §3②：flock 臂 : > 的截断不经本函数，措辞随事实收窄）。"""
+    """锁内核截断目标文件。**只许 pending**；append-only 资产一律拒绝。"""
     if target != "pending":
         return 21, "truncate only allowed for pending (append-only assets never truncate)"
     gzx_dir = _normalize_dir(gzx_dir)
@@ -166,14 +202,8 @@ def lock_truncate(gzx_dir, target):
         with open(lockpath, "a+") as lf:
             _lock(lf)
             try:
-                # 存在性检查在锁内（用户 PR#4 follow-up P1：锁外检查+返回成功的
-                # 竞态=clear 报成功而另一进程刚锁内追加的内容残留不截断）。
-                # 缺文件=本就为空，与 flock 路径(: >)同语义。
                 if not os.path.exists(targetpath):
                     return 0, "ok pending (already empty)"
-                # 锁内截断：pending 唯一清空通道——不经过任何写模式打开，
-                # 静态围栏（不变量套件 B2/B3）锁定本函数为全文件唯一截断点；
-                # append-only 资产（map/jsonl/candidates/audit）永远到不了这里。
                 os.truncate(targetpath, 0)
             finally:
                 lf.close()
