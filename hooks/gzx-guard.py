@@ -575,34 +575,40 @@ def _pregate_expansion(toks, segments, seg_words):
     return None
 
 
-def _name_arm_hit(seg_words):
-    """名字臂（臂③，进范围的第三条件）：执行位的写入器/CLI 名按逐词 basename
-    相等（含引用参数的空白分段组件——`bash "fake gzx-append.sh" map` 的引号
-    参数名含写入器名，claude #3065 §2）进范围；禁全文正则。执行位 = 有效命令名、
-    bash/sh/source/. 的参数、python/python3 的脚本位。git add / echo 的参数不在
-    执行位 ⇒ 同仓三条保持放行（pi #3058 §B-3）。"""
-    for words in seg_words:
-        head_w = _effective_head(words)
-        if head_w is None:
-            continue
-        head_base = _basename(head_w).lower()
+def _name_arm_hit(segments):
+    """名字臂（臂③，进范围的第三条件）：执行位的写入器/CLI 名按**原始词元**
+    basename 相等（含引用参数的空白分段组件——`bash "fake gzx-append.sh" map`
+    的引号参数名含写入器名，claude #3065 §2）进范围；禁全文正则。
+    走 raw token 而非重建词（grok #3069 §2：`bash --rcfile "a b" gzx-append.sh`
+    的选项+引号值+脚本位会被词重建粘成一个词，重建词层的名字检查被打穿——
+    原始词元层 `gzx-append.sh` 独立可见）。执行位 = 有效命令名、bash/sh/source/.
+    的参数、python/python3 的脚本位。git add / echo 的参数不在执行位 ⇒ 同仓
+    三条保持放行（pi #3058 §B-3）。"""
+    for seg in segments:
+        head_t = seg[0]
+        rest = seg[1:]
+        while _ENV_ASSIGN_RE.match(head_t) and rest:
+            head_t = rest[0]
+            rest = rest[1:]
+        head_base = _basename(head_t).lower()
+        if head_base.endswith(".exe"):
+            head_base = head_base[:-4]
         if head_base in _NAME_BASENAMES:
             return True
         if head_base in SHELL_WRAPPERS:
-            if any(any(c.lower() in _NAME_BASENAMES for c in _name_components(w))
-                   for w, _q in words[1:]):
+            if any(any(c.lower() in _NAME_BASENAMES for c in _name_components(t))
+                   for t in rest):
                 return True
         elif _is_py_head(head_base):
-            arg_toks = [w for w, _q in words[1:]]
-            idx = _py_script_slot_idx(arg_toks)
+            idx = _py_script_slot_idx(rest)
             if idx is not None:
                 if any(c.lower() in _NAME_BASENAMES
-                       for c in _name_components(arg_toks[idx])):
+                       for c in _name_components(rest[idx])):
                     return True
     return False
 
 
-def _in_scope_tokens(toks, bodies, seg_words):
+def _in_scope_tokens(toks, bodies, segments):
     """token 级范围判定（dsh #3055 §6-1：范围门挪到分词之后）。
     任一命令行词元含数据目录标记，或 heredoc 正文含标记，或名字臂命中 ⇒ 进范围。"""
     for t in toks:
@@ -615,7 +621,7 @@ def _in_scope_tokens(toks, bodies, seg_words):
         for m in _protected_markers():
             if m in b or m.lower() in low:
                 return True
-    return _name_arm_hit(seg_words)
+    return _name_arm_hit(segments)
 
 
 def _check_redirect(toks, i):
@@ -738,7 +744,7 @@ def classify(cmd):
         return d_gate
 
     # 4./5. 范围门（token 级标记 + heredoc 正文标记 + 名字臂）
-    if not _in_scope_tokens(toks, bodies, seg_words):
+    if not _in_scope_tokens(toks, bodies, segments):
         return Decision(True, "out-of-scope")
 
     # 6. 范围内主循环（基线同序：结构符拒 → 管道分段 → 重定向判定）
@@ -1046,6 +1052,11 @@ def selftest():
         # 邻接引号 + 名字子串的 echo 形态也拒（fail-closed；`echo see gzx-append`
         # 带空格形态保持放行）：
         ("echo\"see gzx-append\"", "expansion:unprovable"),
+        # grok #3069 §2 验收行：选项+引号值+脚本位被词重建粘合的形态走 raw token 判
+        ("bash --rcfile \"a b\" gzx-append.sh", "prefix:bash"),
+        ("python3 -X \"pycache_prefix=/tmp/a b\" /tmp/evil/gzx_cli.py save-cell", "prefix:python3"),
+        ("bash --rcfile /dev/null gzx-append.sh", "prefix:bash"),
+        ("python3 -X pycache_prefix=/tmp/ab /tmp/evil/gzx_cli.py save-cell", "prefix:python3"),
         # 身份位扩展算子（dsh #3061 §2 身份位同病）
         ("$SCRIPT map", "expansion:unprovable"),
         ("\"$PY\" /tmp/evil/gzx_cli.py save-cell", "expansion:unprovable"),

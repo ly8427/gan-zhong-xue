@@ -13,7 +13,7 @@
   - `gzx_cli.py check-divergence`（及 `preflight`）做两级发散检测：
     - 计数级：`map.md` `^## ` 格数 vs `map.jsonl` 行数；
     - 字段级（重建 + diff）：jsonl 每行按 `(概念, 分层)` 与 md 格**按追加顺序逐位配对**，逐字段比对渲染面（正常格比对 证据/先猜/顶点原理/底部验证题/用户更懂/状态；⏸ 暂停格比对 来源/关联靶/关联节点/备注/状态），明细进 `cell_check.mismatches`；
-    - 一致时返回 0；计数不匹配、字段不符（`field-mismatch`）或 md 孤立格（`orphan_md_cells > 0`）返回专用退出码 **24** 并输出两侧差异与从 `map.jsonl` 重建的指引；
+    - 一致时返回 0；计数不匹配、字段不符（`field-mismatch`）或 md 孤立格（`orphan_md_cells > 0`）返回专用退出码 **24** 并输出两侧差异与从 `map.jsonl` 重建的指引（mismatches 明细上限 10 条防刷屏，超出截断）；
     - 缺少依赖或文件不可读返回 21/22。
   - `gzx_cli.py cell`：同概念跨多个分层时返回 `ambiguous: true` 并以退出码 **25** 拒绝静默取格（`cell <概念> <分层>` 按 (概念, 分层) 精确取格），杜绝跨层 last-wins 取错验证题。
 

@@ -5,10 +5,13 @@
 将第 -1 步多条碎命令与第 3 步双写/校验收进确定性 Python 接口：
   preflight         初始化目录与写入器、读取 pending/candidates/map.jsonl 摘要、检测双地图发散
   cell <概念>       读取指定概念的最新 jsonl 记录与 map.md 对应段落
-  save-cell         校验 stdin JSON 并同锁原子追加到 map.jsonl 与 map.md
+                    （同概念跨多分层时报歧义退出码 25；cell <概念> <分层> 精确取格）
+  save-cell         校验 stdin JSON 并经同一把锁互斥追加到 map.jsonl 与 map.md
+                    （单写者互斥；非跨文件事务原子，见 gzx_lock_append.py 模块头）
   pending-add       从 stdin 追加到 pending.md（走写入器锁）
   pending-clear     锁内清空 pending.md
-  check-divergence  比对 map.md 格数（^## ）与 map.jsonl 行数（D2 发散检测）
+  check-divergence  按 (概念,分层) 将 map.jsonl 行与 map.md 格逐位配对、逐字段
+                    比对渲染面（重建+diff，D2 发散检测；计数/字段/孤立格均报）
 """
 
 import json
