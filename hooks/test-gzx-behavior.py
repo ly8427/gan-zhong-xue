@@ -12,6 +12,8 @@
        写入必须只来自官方件）；③ 假写入器排在 PATH 最前。
   C. 牙口自证：不带官方名的诱饵脚本（设计上放行）必须被检出写入——证明「检出器」
      真的看得见写入；再把守卫的保护逐个摘掉（变异），矩阵必须变红。
+     矩阵里另有一族「陪衬官方名」命令（Bugbot 4728123561）：官方路径只当参数带上，
+     真正执行的是别的程序，直写诱饵目录——必须全拒。
 运行：python hooks/test-gzx-behavior.py   （0 = 全过）
 环境变量 GZX_GUARD_UNDER_TEST=<守卫路径> 可指定被测守卫（默认同目录 gzx-guard.py；
 用于「把旧头守卫放进来跑，必须红」的对照）。
@@ -508,6 +510,24 @@ def test_behavior(g, bash, work):
     matrix = (list(gen(targets_sh, WRAPPERS_SH + PAYLOAD_WRAPPERS))
               + list(gen(targets_py, WRAPPERS_PY))
               + list(gen(targets_sh, WRAPPERS_PY[:2])))
+    # ── 陪衬官方名族（Bugbot 4728123561）：官方路径只当参数带上，真正执行的是别的程序。
+    #    {D}=诱饵数据目录（守卫的 GZX_DIR），{E}=假件目录。这些必须全拒；一旦放行就会真写诱饵。
+    #    （`env bash <无官方名脚本> <官方路径>` 不在此列：被执行的是不带官方名的脚本，属已申报边界。）
+    d_posix = _posix(decoy)
+    DECOY_ARG = [
+        "env tee {D}/map.md {D}/gzx-append.sh",
+        "env sh -c 'printf x >> {D}/map.md' {D}/gzx-append.sh",
+        "sudo -n sh -c 'printf x >> {D}/map.md' {D}/gzx-append.sh",
+        "timeout 5 bash -c 'printf x >> {D}/map.md' {D}/gzx-append.sh",
+        "nohup sh -c 'printf x >> {D}/map.md' bash {D}/gzx-append.sh",
+        "env -i sh -c 'printf x >> {D}/map.md' {D}/gzx-append.sh",
+        "env bash {E}/plain.sh {D}/map.md {D}/gzx-append.sh",
+        "W={D}/gzx-append.sh sudo -n tee {D}/map.md $W",
+        "FOO={D}/gzx-append.sh env bash {E}/plain.sh",
+    ]
+    decoy_arg = [(w.replace("{D}", d_posix).replace("{E}", e_posix), ("decoy-arg", w))
+                 for w in DECOY_ARG]
+    matrix += decoy_arg
     check("B0 矩阵规模（启动器 × 路径写法 × 引号 × 前缀的笛卡尔积）≥ 2000", len(matrix) >= 2000,
           "got %d" % len(matrix))
 
@@ -550,6 +570,10 @@ def test_behavior(g, bash, work):
         allowed1 = [(c, k) for c, k, a, _r in res1 if a]
         check("B1 环境①（官方件不在 PATH）：矩阵 %d 条**全部拒**" % len(matrix), not allowed1,
               "放行 %d 条，例如 %r" % (len(allowed1), allowed1[:3]))
+        da_allowed = [(c, r) for c, k, a, r in res1 if k[0] == "decoy-arg" and a]
+        check("B6 陪衬官方名族（Bugbot 4728123561）：官方路径当参数带上的 env / sudo / timeout / "
+              "bash -c %d 条**全拒**" % len(decoy_arg), not da_allowed,
+              "放行 %d 条，例如 %r" % (len(da_allowed), da_allowed[:2]))
 
         # ── 环境③：假写入器排在 PATH 最前 ──
         use_path(guard_path(evil))
@@ -654,8 +678,10 @@ def test_behavior(g, bash, work):
             "bash <<< '%s/gzx-append.sh map'" % e_posix,
             "env bash gzx-append.sh map",          # 参数位裸名（当前目录即 evil，有同名假件）
             "python3 gzx_cli.py save-cell",
+            decoy_arg[0][0], decoy_arg[1][0],      # 陪衬官方名：别的程序直写诱饵
         ]
-        names = ("_identity_ok", "_is_launcher_cmd", "_name_hit", "_has_expansion")
+        names = ("_identity_ok", "_is_launcher_cmd", "_name_hit", "_has_expansion",
+                 "_official_chunk_clean")
         orig = dict((n, getattr(g, n, None)) for n in names)
 
         def undo():
@@ -690,9 +716,13 @@ def test_behavior(g, bash, work):
                 hit = real(text)
                 return None if (hit and hit[0] == "payload") else hit
             g._name_hit = no_payload
+
+        def m4():
+            g._official_chunk_clean = lambda c: True
         mutated("身份检查（_identity_ok 恒真）", m1, 5)
         mutated("启动器清单（只剩官方名为命令名）", m2, 4)
         mutated("程序串里的官方名（payload 规则）", m3, 1)
+        mutated("陪衬官方名（_official_chunk_clean 恒真）", m4, 2)
 
         if orig["_has_expansion"] is not None:
             g._has_expansion = lambda s: False

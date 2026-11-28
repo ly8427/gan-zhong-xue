@@ -26,7 +26,7 @@
   - **范围门**：词里引用运行时数据目录（`.gan-zhong-xue` / `GZX_DIR`）∨ heredoc 正文含标记 ∨ 启动器命令里出现已核实的官方名；范围外直接放行（`out-of-scope`）。常规仓内开发、`git commit`、文档 `Write`/`Edit` 及不含数据目录引用的 `Agent` 提示词不受影响——`git add` / `cp` / `vim` 的命令名不是启动器类，只是在处理一个叫这名字的文件。
   - **字面性闸**（与范围无关，进出范围两向都拦）：命令名、写文件的重定向目标出现 `$` 变量 / 命令替换 / `` ` `` / `*?[]{}` ⇒ 拒（`expansion:unprovable`）；脚本执行型命令（shell / 解释器）的其余参数同样必须字面（带空白的引号串除外——那是程序文本，不是脚本路径）。fd 复制（`2>&1`）与输入重定向（`<` `<<` `<<<`）不查。判据是「落盘路径 / 被执行的脚本能不能静态证明」，不是「展开后像不像受保护路径」（守卫不做展开模拟）。
   - **范围内结构层**：`;` `&&` `||` `&` 换行 括号 进程替换、活的命令替换（含藏在双引号里的 `` `…` `` 与 `$(…)`）、重定向落数据目录、非官方 heredoc 一律拒；逐命令块查只读前缀白名单与引导安装豁免。
-  - **身份层不放宽**：官方写入器 / CLI 按解析路径精确相等；`unparseable` 命令默认拒。**裸写入器名只在命令名位可信**（`gzx-append map`，且要求 PATH 上解析到官方位、PATH 里没有排在它前面的「当前目录项」、命令不带 `PATH=` 前缀）——实测 bash / sh 找脚本参数时**先看当前目录再看 PATH**（python 只看当前目录），当前目录里的同名假件会遮住 PATH 上的官方件，所以参数位上的裸名（`bash gzx-append.sh`、`env gzx-append.sh`）与安装态无关、一律拒。
+  - **身份层不放宽**：官方写入器 / CLI 按解析路径精确相等；`unparseable` 命令默认拒。**官方名在固定位只证明这个名字指的不是假件，不证明被执行的就是官方件**——靠官方名放行的启动器命令块，从命令名位置起到第一个官方名之间只允许启动器名、选项、字面赋值；这段里出现别的程序（带空白的程序串、含扩展算子或命令替换的词）或对数据目录的引用 ⇒ 仍按前缀白名单拒（`env tee <数据目录>/map.md <官方写入器>` 这类「陪衬官方名」，Bugbot 4728123561）。**裸写入器名只在命令名位可信**（`gzx-append map`，且要求 PATH 上解析到官方位、PATH 里没有排在它前面的「当前目录项」、命令不带 `PATH=` 前缀）——实测 bash / sh 找脚本参数时**先看当前目录再看 PATH**（python 只看当前目录），当前目录里的同名假件会遮住 PATH 上的官方件，所以参数位上的裸名（`bash gzx-append.sh`、`env gzx-append.sh`）与安装态无关、一律拒。
   - 放行官方 `gzx-append.sh`、`gzx_cli.py`（含 `save-cell` / `pending-add` heredoc）、`cp`/`mkdir`/`chmod 700` 引导安装及只读前缀白名单。
   - 审计只记录 `{ts, tool, decision, rule}` 元数据，首行保证写入 `hook_alive` 活体事件。规则名：放行 = `out-of-scope` / `readonly-ok` / `writer-heredoc:<n>B` / `cli-heredoc:<n>B`；拒 = `identity:<名字>` / `payload:<名字>` / `expansion:unprovable` / `structure:<操作符>` / `structure:unparseable` / `structure:heredoc` / `redirect-to-protected:<操作符>` / `redirect:missing-target` / `prefix:<命令名>` / `find:<旗标>` / `sed:-i` / `heredoc:*` / `write-tool:protected-path` / `agent:protected-ref`。
 - **`hooks/gzx-capture.py`（PostToolUse）**：
@@ -49,6 +49,7 @@
    - `hooks/matcher.json` 仍保留待实测标记，跨宿主接线能力以实际运行验证为准。
    - **守卫的已知代价与边界**（board #129 评审共识；按族列出，每族在 `gzx-guard.py --selftest` 里配一对用例——一条 allow 钉「当前不审计」，一条 deny 钉已收口的部分，dsh #3072 §1-1 对价）：
      - 完全不出现官方名与数据目录的脚本不审计：`bash /tmp/evil.sh`（放行）↔ `bash /tmp/evil/gzx-append.sh map`（拒）。
+     - 被执行的是不带官方名的脚本、官方路径只当参数：`env bash /tmp/evil.sh ~/.gan-zhong-xue/gzx-append.sh`（放行，与 `env bash /tmp/evil.sh` 等价）↔ 官方名之前还有别的程序或对数据目录的引用：`env tee ~/.gan-zhong-xue/map.md ~/.gan-zhong-xue/gzx-append.sh`（拒 `prefix:env`）。
      - 启动器清单是**封闭**的：清单外的自定义 wrapper（`py`、`pypy3`、`ssh host bash …`、`docker exec … bash …` 等）不识别，补清单是配置不是机制 ↔ 清单内任意嵌套 `sudo -n env nice -n 5 timeout 5 bash /tmp/evil/gzx-append.sh map`（拒）。
      - 泛启动器（env / sudo / nohup / timeout / xargs …）之后的**非字面参数**不查：`sudo bash $SCRIPT map`、`nohup python3 server.py --port $PORT`（放行）↔ 脚本执行型命令自身的参数必须字面：`bash $SCRIPT map`（拒）。要收需要白名单封闭，会误伤 `find -exec python3 … {}`、`xargs -I{} bash -c … {}` 这类日常写法，故登记为契约边界。
      - 参数位的裸写入器名一律拒（`bash gzx-append.sh`、`env gzx-append.sh`）↔ 命令名位的裸名在 PATH 解析到官方位时放行（`gzx-append map`；`test-gzx-behavior.py` 环境② 把这个安装态造出来真跑，两种平台都不跳过）。

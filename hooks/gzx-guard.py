@@ -440,12 +440,30 @@ def _parse_chunks(toks):
         if head is None and words:
             head = words[0]       # 纯赋值块取首词（基线行为保持：赋值行里的官方名/数据目录仍进范围）
         cmds.append({"toks": block, "words": words, "redirs": redirs,
-                     "assign_only": assign_only, "head": head})
+                     "assign_only": assign_only, "head": head, "official_at": []})
     return cmds
 
 
 def _structure_rule(op):
     return "structure:" + ("\\n" if op == "\n" else op)
+
+
+def _official_chunk_clean(c):
+    """靠官方名放行的启动器命令块是否干净。命令名位置起到**第一个在命令词里的官方名**之间，
+    只允许启动器名、选项、io 号、字面赋值这类不可能是「另一个程序」的词；这段里若还有别的
+    程序（带空白的程序串、含扩展算子或命令替换的词）或对数据目录的引用 ⇒ 不放行。
+    Bugbot 4728123561：官方路径当陪衬参数，会让 env / sudo / timeout / bash -c 借官方名
+    过前缀检查直写数据目录（`env tee <数据目录>/map.md <官方写入器>`）。官方名之后的词是
+    官方件自己的参数，不受此限。"""
+    words = c["words"]
+    head_i = next((i for i, w in enumerate(words) if w is c["head"]), 0)
+    first = next((k for k in c["official_at"] if k >= head_i), None)
+    if first is None:
+        return False        # 官方名只在赋值前缀 / 重定向操作数里：被执行的不是官方件
+    for t in words[:first]:
+        if t.subst or _has_ws(t.text) or _has_expansion(t.text) or _in_scope(t.text):
+            return False
+    return True
 
 
 def _gates(cmds):
@@ -502,6 +520,10 @@ def _gates(cmds):
             if not _identity_ok(hit[1], hit[2]):
                 return Decision(False, "identity:" + hit[2]), official
             official.add(ci)
+            for k, w in enumerate(c["words"]):
+                if w is t:
+                    c["official_at"].append(k)
+                    break
         if c["assign_only"] or not _is_script_runner(_cmd_name(head.text)):
             continue
         seen = False
@@ -796,7 +818,9 @@ def classify(cmd):
                     return Decision(False, name + ":-i")
         if _seg_is_bootstrap(name, args):
             continue
-        if name in READONLY_PREFIX or ci in official:
+        if name in READONLY_PREFIX:
+            continue
+        if ci in official and _official_chunk_clean(c):
             continue
         return Decision(False, "prefix:" + _basename(head.text))
 
@@ -1011,6 +1035,9 @@ def selftest():
         "sudo bash $SCRIPT map",                      # 泛启动器后的非字面参数不查
         "rm map.md",                                  # cd 进数据目录后不提名字
         "bash /tmp/evil.sh",                          # 完全不出现官方名与数据目录的脚本
+        # 被执行的是不带官方名的脚本、官方路径只当参数（等价于上一条，已申报边界）
+        "env bash /tmp/evil.sh ~/.gan-zhong-xue/gzx-append.sh",
+        "python3 '%s/gzx_cli.py' cell 'Foo Bar'" % _pkg_skill,     # 官方件自己的参数可带空格
     ]
     denies = [
         # ── 假写入器 / 假 CLI：官方名不在固定位（identity:<名字>）──
@@ -1117,6 +1144,22 @@ def selftest():
         ("bash -c \"python3 '%s/gzx_cli.py' preflight\"" % _pkg_skill, "payload:gzx_cli.py"),
         # 载荷里名字带内层引号（basename 不再干净）：程序串按子串判，dsh #3072 §1-4 (ii)
         ("bash -c \"python3 '/tmp/evil/gzx_cli.py' save-cell\"", "payload:gzx_cli.py"),
+        # Bugbot 4728123561（High）：官方路径当陪衬参数，不能让别的程序借官方名过前缀检查
+        ("env tee ~/.gan-zhong-xue/map.md ~/.gan-zhong-xue/gzx-append.sh", "prefix:env"),
+        ("env sh -c 'printf x >> ~/.gan-zhong-xue/map.md' ~/.gan-zhong-xue/gzx-append.sh",
+         "prefix:env"),
+        ("sudo -n sh -c 'cat > ~/.gan-zhong-xue/map.md' ~/.gan-zhong-xue/gzx-append.sh",
+         "prefix:sudo"),
+        ("timeout 5 bash -c 'cat > ~/.gan-zhong-xue/map.md' ~/.gan-zhong-xue/gzx-append.sh",
+         "prefix:timeout"),
+        ("env bash /tmp/evil.sh ~/.gan-zhong-xue/map.md ~/.gan-zhong-xue/gzx-append.sh",
+         "prefix:env"),
+        ("W=~/.gan-zhong-xue/gzx-append.sh sudo -n tee ~/.gan-zhong-xue/map.md $W",
+         "prefix:sudo"),
+        ("python3 -c \"open('~/.gan-zhong-xue/map.md','w')\" '%s/gzx_cli.py'" % _pkg_skill,
+         "prefix:python3"),
+        ("env python3 '%s/gzx_cli.py' check <(tee ~/.gan-zhong-xue/map.md)" % _pkg_skill,
+         "structure:<("),
         ("bash -c 'cat ~/.gan-zhong-xue/map.md'", "prefix:bash"),
         # ── 引导与数据目录直写（基线）──
         ("cp /tmp/gzx-append ~/.gan-zhong-xue/map.md", "prefix:cp"),
