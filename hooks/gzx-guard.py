@@ -320,7 +320,9 @@ def _tok_kind(t):
 
 def _segment_words(frags):
     """把一个段内的词元重建为「词」：[(文本, 是否含引用内容)]。
-    相邻 word+word ⇒ 新词（必有空白）；其余相邻续接同词；
+    相邻 word+word ⇒ 新词（必有空白）；**quoted 词元必自成一个词**（posix 邻接
+    引号会并入前词元——独立的 quoted 词元证明其前必有空白，claude #3065 §2：
+    否则 `bash "fake gzx-append.sh" map` 的引号参数被粘进命令头词，名字臂失明）；
     词首孤立 [ 或 { 视为完整词（test 内建 / 花括号组保留基线语义）；
     当前词恰为保留字时必断词（`if [` 的 if 与 [ 不可粘）。"""
     out = []
@@ -329,7 +331,10 @@ def _segment_words(frags):
     for t in frags:
         kind = _tok_kind(t)
         q = kind == "quoted"
-        new_word = cur is None or (prev_kind == "word" and kind == "word")
+        # quoted 词元两侧自定界：引号内容 posix 邻接会并入前词元，独立成词元
+        # 即证明其前后都有空白 ⇒ quoted 必开新词，其后一词也必开新词
+        new_word = cur is None or q or prev_kind == "quoted" or \
+            (prev_kind == "word" and kind == "word")
         if cur is not None and cur[0] in _SHELL_RESERVED and not cur[1]:
             new_word = True
         if not new_word:
@@ -346,6 +351,16 @@ def _segment_words(frags):
     if cur is not None:
         out.append(cur)
     return out
+
+
+def _name_components(tok):
+    """词元的名字候选组件：basename 按空白分段（`fake gzx-append.sh` 的
+    `gzx-append.sh` 段也算命中候选——写入器名含在带空格的引号路径里时
+    名字臂仍可达；身份层随后按精确解析判定）。"""
+    base = _basename(tok).replace("\\", "/")
+    comps = [c for c in base.split(" ") if c]
+    comps.append(base)
+    return comps
 
 
 def _split_segments(toks):
@@ -495,6 +510,13 @@ def _pregate_expansion(toks, segments, seg_words):
             prefix = _head_static_prefix(head_w)
             if _has_expansion(prefix) or prefix == "":
                 return Decision(False, "expansion:unprovable")
+            # 邻接引号并入命令头词（bash"fake…"map，token 含空白即证据）：
+            # 静态前缀是执行位名，或头词内含写入器/CLI 名（'bash'与引号内容的
+            # 边界不可恢复，名字可能被截断——claude #3065 §2 形态 (b)）⇒ 不可证拒
+            if (" " in head_w or "\t" in head_w) and (
+                    prefix.lower() in SHELL_WRAPPERS or _is_py_head(prefix.lower())
+                    or any(n in head_w for n in _NAME_BASENAMES)):
+                return Decision(False, "expansion:unprovable")
         else:
             prefix = head_w
         head_base = prefix.lower()
@@ -503,7 +525,8 @@ def _pregate_expansion(toks, segments, seg_words):
         if is_wrapper or is_py:
             # 参数闸（含命令名词里粘着的动态尾巴：bash$SCRIPT 的 $SCRIPT 就是
             # 它的第一个参数——word→frag 边界的空白不可区分，按参数对待）。
-            # 引用串（含空白）豁免：bash -c 'payload' 的载荷不在此审计。
+            # 引用串（含空白）豁免 expansion 闸；其写入器/CLI 名组件由名字臂
+            # 进范围后交身份层判定（claude #3065 §2 修法 (a)）。
             arg_words = []
             if head_w != prefix:
                 arg_words.append((head_w[len(prefix):], False))
@@ -554,10 +577,10 @@ def _pregate_expansion(toks, segments, seg_words):
 
 def _name_arm_hit(seg_words):
     """名字臂（臂③，进范围的第三条件）：执行位的写入器/CLI 名按逐词 basename
-    相等（禁全文正则——21531ca 全文正则误杀同仓，38231ee 撤名臂后假 CLI 直跑
-    重开；此处为收敛形态）。执行位 = 有效命令名、bash/sh/source/. 的参数、
-    python/python3 的脚本位。git add / echo 的参数不在执行位 ⇒ 同仓三条保持
-    放行（pi #3058 §B-3）。"""
+    相等（含引用参数的空白分段组件——`bash "fake gzx-append.sh" map` 的引号
+    参数名含写入器名，claude #3065 §2）进范围；禁全文正则。执行位 = 有效命令名、
+    bash/sh/source/. 的参数、python/python3 的脚本位。git add / echo 的参数不在
+    执行位 ⇒ 同仓三条保持放行（pi #3058 §B-3）。"""
     for words in seg_words:
         head_w = _effective_head(words)
         if head_w is None:
@@ -566,13 +589,15 @@ def _name_arm_hit(seg_words):
         if head_base in _NAME_BASENAMES:
             return True
         if head_base in SHELL_WRAPPERS:
-            if any(_basename(w).lower() in _NAME_BASENAMES for w, _q in words[1:]):
+            if any(any(c.lower() in _NAME_BASENAMES for c in _name_components(w))
+                   for w, _q in words[1:]):
                 return True
         elif _is_py_head(head_base):
-            idx = _py_script_slot_idx([w for w, _q in words[1:]])
+            arg_toks = [w for w, _q in words[1:]]
+            idx = _py_script_slot_idx(arg_toks)
             if idx is not None:
-                w = [w for w, _q in words[1:]][idx]
-                if _basename(w).lower() in _NAME_BASENAMES:
+                if any(c.lower() in _NAME_BASENAMES
+                       for c in _name_components(arg_toks[idx])):
                     return True
     return False
 
@@ -903,6 +928,9 @@ def selftest():
         "echo $HOME",
         "grep $PAT ~/.gan-zhong-xue/map.md",
         "python3 -m py_compile skills/gan-zhong-xue/gzx_cli.py",
+        # 引号参数良性形态（claude #3065 §2 修复不放伤 benign 引号参数）
+        "bash \"my notes.txt\"",
+        "bash\"my notes.txt\"",
     ]
     denies = [
         # Bugbot 新增防护用例：shell wrapper 运行本地目录伪造写入器触碰数据目录必拒
@@ -1009,6 +1037,15 @@ def selftest():
         # heredoc 包装器 / 无引号定界符形态到不了身份层 → 剥离后进身份层被拒
         ("bash gzx-append.sh map <<E\nhello\nE", "prefix:bash", "writer-not-on-path"),
         ("bash /tmp/evil/gzx-append.sh map <<'E'\nhello\nE", "prefix:bash"),
+        # 引号参数漏报族（claude #3065 §2）：含空格的引号参数粘进命令头词后
+        # 名字臂失明——quoted 词元两侧自定界断词 + 名字组件匹配 + 邻接吸收拒
+        ("bash \"fake gzx-append.sh\" map", "prefix:bash"),
+        ("python3 \"fake gzx_cli.py\" save-cell", "prefix:python3"),
+        ("bash\"fake gzx-append.sh\"map", "expansion:unprovable"),
+        ("bash\"fake gzx_cli.py\"save-cell", "expansion:unprovable"),
+        # 邻接引号 + 名字子串的 echo 形态也拒（fail-closed；`echo see gzx-append`
+        # 带空格形态保持放行）：
+        ("echo\"see gzx-append\"", "expansion:unprovable"),
         # 身份位扩展算子（dsh #3061 §2 身份位同病）
         ("$SCRIPT map", "expansion:unprovable"),
         ("\"$PY\" /tmp/evil/gzx_cli.py save-cell", "expansion:unprovable"),
