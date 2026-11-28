@@ -24,3 +24,5 @@ jobs:
         run: python hooks/test-gzx-invariants.py
       - name: Run integration suite
         run: python hooks/test-gzx-integration.py
+      - name: Run guard behavior suite (lexer table + real-run adversarial matrix)
+        run: python hooks/test-gzx-behavior.py
