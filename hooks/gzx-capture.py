@@ -54,6 +54,33 @@ _SHELL_RESERVED = {"if", "then", "else", "elif", "fi", "for", "while", "until", 
                    "[[", "]]", "coproc", "select"}
 _REDIRECT_OPS = {">", ">>", "<", ">|", "<&", ">&", "&>", "&>>", "<>"}
 _ALL_BOUNDARIES = _CMD_SEPARATORS | _SHELL_RESERVED | _REDIRECT_OPS
+_PUNCT_SET = set("();<>|&\n")
+# 全标点粘连词元的拆分表：已知复合操作符最长匹配，其余拆单字符。
+# `);` 粘连是 punctuation_chars 把连续标点并成单 token 的第三次现形
+# （grok #3054/#3059、dsh #3055 §5-4）：`( cd x && git commit ); git commit`
+# 的外层 commit 因 `);` 不在分隔符集而漏捕获。
+_GLUED_COMPOUND = ("&&", "||", "|&", "&>>", "&>", ">>", ">|", "<>", ">&",
+                   "<<<", "<<", ";;")
+
+
+def _split_glued_punct(tok):
+    """全标点词元 → 复合操作符最长匹配 + 单字符；含非标点字符的词元原样返回。"""
+    if tok in _ALL_BOUNDARIES:
+        return [tok]
+    if not tok or any(c not in _PUNCT_SET for c in tok):
+        return [tok]
+    out = []
+    i = 0
+    while i < len(tok):
+        for op in _GLUED_COMPOUND:
+            if tok.startswith(op, i):
+                out.append(op)
+                i += len(op)
+                break
+        else:
+            out.append(tok[i])
+            i += 1
+    return out
 
 
 def _lex(cmd):
@@ -79,7 +106,10 @@ def _lex(cmd):
             continue
         merged.append(tok)
         i += 1
-    return merged
+    final = []
+    for tok in merged:
+        final.extend(_split_glued_punct(tok))
+    return final
 
 
 def _iter_simple_commands_with_seps(cmd):
