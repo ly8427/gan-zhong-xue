@@ -590,17 +590,23 @@ def test_behavior(g, bash, work):
         use_path(saved_path)
 
     # ── 真跑 ──
+    def _fmt(violations):
+        pwn = [1 for _c, w in violations if "PWNED" in w]
+        return ("共 %d 条命令改动了诱饵目录（其中 %d 条是假件写入）；例如 "
+                % (len(violations), len(pwn))
+                + "；".join("%s：%s" % (c, w) for c, w in violations[:3]))
+
     restore()
     v1 = run_allowed([c for c, _k in allowed1], env1, False)
     check("B4 环境①：守卫放行的攻击形命令真跑后诱饵未被写（放行并真跑 %d 条）"
-          % len(allowed1), not v1, "；".join("%s：%s" % (c, w) for c, w in v1[:4]))
+          % len(allowed1), not v1, _fmt(v1))
 
     # 环境②：放行的命令名位裸名真跑——写入只许来自官方件
     sample2 = [c for c, k in allowed2]
     restore()
     v2 = run_allowed(sample2, env2, True)
     check("B5 环境②：命令名位的裸名真跑 %d 条，写入只来自官方件（无 PWNED）" % len(sample2),
-          not v2, "；".join("%s：%s" % (c, w) for c, w in v2[:4]))
+          not v2, _fmt(v2))
 
     # ── C. 牙口自证 ──
     use_path(guard_path())
