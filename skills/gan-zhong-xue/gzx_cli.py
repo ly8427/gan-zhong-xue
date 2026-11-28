@@ -471,7 +471,15 @@ def _validate_and_render_cell(obj):
 
 
 def cmd_save_cell(gzx_dir):
-    raw = sys.stdin.read()
+    # stdin 按字节读 + 显式 UTF-8 解码：Windows 控制台（cp1252 实测）把文本模式的
+    # stdin 也按本地编码解码，中文 JSON 的键会被读成乱码导致「缺字段」——
+    # 跨平台口径（PR #7 P1）：JSON 必须是 UTF-8。
+    raw_bytes = sys.stdin.buffer.read()
+    try:
+        raw = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as e:
+        sys.stderr.write("gzx-cli: stdin is not valid UTF-8: %s\n" % e)
+        return 21
     if not raw.strip():
         sys.stderr.write("gzx-cli: empty stdin\n")
         return 21
@@ -522,6 +530,13 @@ def cmd_check_divergence(gzx_dir):
 
 
 def main(argv=None):
+    # 输出流强制 UTF-8：preflight/cell 打印中文 JSON，Windows cp1252 控制台打印即崩
+    # （与 hooks/test-gzx-*.py 的同款防护一致）。
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     args = sys.argv[1:] if argv is None else argv
     if not args:
         sys.stderr.write(
