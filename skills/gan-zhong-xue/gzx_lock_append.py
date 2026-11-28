@@ -14,6 +14,8 @@ gzx-append.sh（bash 面）、gzx_cli.py（聚合 CLI）与 hooks/ 的 python �
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 
 TARGETS = {
@@ -23,6 +25,28 @@ TARGETS = {
     "candidates": "candidates.jsonl",
     "audit": "audit.jsonl",
 }
+
+
+def find_git_bash():
+    """跨平台探测可用的 bash（唯一共享实现，CLI 自检与测试套件同口径——
+    grok #3054 A-7：CLI 的 Windows 分支此前 which("bash") 可能选中 WSL bash，
+    与测试套件的避开 WSL 口径不一致）。Windows 上先固定安装位，which 结果须为
+    MINGW/MSYS；POSIX 直接系统 bash。找不到返回 None。"""
+    if os.name != "nt":
+        return shutil.which("bash")
+    for cand in (r"C:\Program Files\Git\bin\bash.exe",
+                 r"C:\Program Files\Git\usr\bin\bash.exe"):
+        if os.path.exists(cand):
+            return cand
+    b = shutil.which("bash")
+    if b:
+        try:
+            r = subprocess.run([b, "-c", "uname -s"], capture_output=True, timeout=15)
+            if b"MINGW" in r.stdout or b"MSYS" in r.stdout:
+                return b
+        except Exception:
+            pass
+    return None
 
 
 def _lock(f):

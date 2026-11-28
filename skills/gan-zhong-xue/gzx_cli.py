@@ -26,6 +26,7 @@ if SKILL_DIR not in sys.path:
 
 from gzx_lock_append import (
     _normalize_dir,
+    find_git_bash,
     lock_append,
     lock_append_map_pair,
     lock_truncate,
@@ -104,16 +105,21 @@ def _bootstrap_writer(gzx_dir):
     return copied
 
 
-def _parse_md_heading_concept(line):
+def _parse_md_heading_parts(line):
+    """「## 概念 · 分层 · 日期」→ [概念, 分层, 日期]（各自 strip）；非格标题 → None。"""
     if not line.startswith("## "):
         return None
-    rest = line[3:].strip()
-    parts = [p.strip() for p in rest.split("·")]
+    parts = [p.strip() for p in line[3:].strip().split("·")]
+    return parts if parts and parts[0] else None
+
+
+def _parse_md_heading_concept(line):
+    parts = _parse_md_heading_parts(line)
     return parts[0] if parts else None
 
 
-def _extract_md_section(md_path, concept):
-    """提取概念对应的 map.md 段落。
+def _extract_md_section(md_path, concept, tier=None):
+    """提取概念对应的 map.md 段落（tier 给出时按 (概念,分层) 双键精确命中）。
     按概念名称精确匹配（防止短名如 'Foo' 误抢 'Foo Bar'），
     并倒序查找最后一次出现的段落（与 jsonl 侧取最新行对齐）。"""
     lines = _read_lines(md_path)
@@ -132,28 +138,121 @@ def _extract_md_section(md_path, concept):
     for sec in reversed(sections):
         if not sec:
             continue
-        c = _parse_md_heading_concept(sec[0])
-        if c == concept:
-            return "\n".join(sec).strip()
+        parts = _parse_md_heading_parts(sec[0])
+        if not parts or parts[0] != concept:
+            continue
+        if tier is not None and (len(parts) < 2 or parts[1] != tier):
+            continue
+        return "\n".join(sec).strip()
     return None
+
+
+def _divergence_cell_check(map_rows, md_sections):
+    """重建 + diff（dsh #3055 §5-2）：jsonl 行与 md 格都是 append-only 日志，
+    同键 (概念,分层) 按追加顺序**按位配对**（第 k 行配第 k 格——同键多行时
+    倒序取最后会把旧行配到新格，实测误报；本注释即 2026-11-28 夹具实证）。
+    逐字段比对渲染面：正常格渲染 证据/先猜/顶点原理/底部验证题/用户更懂/状态；
+    ⏸ 暂停格渲染 来源/关联靶/关联节点/备注/状态——jsonl 有而渲染面没有的
+    字段（如正常格的备注）不比对，不做无据断言。mismatches 上限 10 条。"""
+    checked = 0
+    mismatches = []
+    paired = 0
+
+    rows_by = {}
+    key_order = []
+    for row in map_rows:
+        k = (row.get("概念"), row.get("分层"))
+        if not k[0] or not k[1]:
+            continue
+        if k not in rows_by:
+            key_order.append(k)
+        rows_by.setdefault(k, []).append(row)
+
+    secs_by = {}
+    for sec in md_sections:
+        parts = _parse_md_heading_parts(sec[0]) if sec else None
+        if not parts or len(parts) < 2:
+            continue          # 无分层的老标题不参与配对（计入 orphan）
+        k = (parts[0], parts[1])
+        secs_by.setdefault(k, []).append(sec)
+
+    label_normal = [("证据", "证据"), ("先猜", "先猜"), ("顶点原理", "顶点原理"),
+                    ("验证题", "底部验证题"), ("用户更懂", "用户更懂"),
+                    ("状态", "状态")]
+    label_paused = [("来源", "来源"), ("关联靶", "关联靶"),
+                    ("关联节点", "关联节点"), ("备注", "备注"),
+                    ("状态", "状态")]
+    for k in key_order:
+        rs = rows_by.get(k, [])
+        ss = secs_by.get(k, [])
+        if len(ss) < len(rs):
+            mismatches.append({"格": k[0], "分层": k[1],
+                               "问题": "md 缺 %d 个对应格" % (len(rs) - len(ss))})
+        for idx, row in enumerate(rs):
+            if idx >= len(ss):
+                break
+            sec = ss[idx]
+            checked += 1
+            paired += 1
+            is_paused = k[1] == "⏸" or row.get("状态") == "⏸外部前置"
+            for key, label in (label_paused if is_paused else label_normal):
+                if key not in row:
+                    continue
+                prefix = "- %s：" % label
+                actual = None
+                for ln in sec:
+                    if ln.startswith(prefix):
+                        actual = ln[len(prefix):]
+                        break
+                if actual is None or actual != str(row[key]):
+                    mismatches.append({"格": k[0], "分层": k[1], "字段": label,
+                                       "jsonl": str(row[key]), "md": actual})
+                    if len(mismatches) >= 10:
+                        return checked, mismatches, paired
+    orphan_md = max(0, len(md_sections) - paired)
+    return checked, mismatches, orphan_md
 
 
 def _divergence_report(gzx_dir):
     md_path = os.path.join(gzx_dir, "map.md")
     jsonl_path = os.path.join(gzx_dir, "map.jsonl")
     md_count = _count_md_cells(md_path)
-    _, bad_lines, jsonl_total = _parse_jsonl(jsonl_path)
-    diverged = md_count != jsonl_total
+    map_rows, bad_lines, jsonl_total = _parse_jsonl(jsonl_path)
+
+    # 重建 + diff：把 md 切成格，jsonl 每行按 (概念,分层) 配对逐字段比对
+    sections = []
+    curr = None
+    for ln in _read_lines(md_path):
+        if ln.startswith("## "):
+            if curr is not None:
+                sections.append(curr)
+            curr = [ln]
+        elif curr is not None:
+            curr.append(ln)
+    if curr is not None:
+        sections.append(curr)
+
+    checked, mismatches, orphan_md = _divergence_cell_check(map_rows, sections)
+    count_diverged = md_count != jsonl_total
+    diverged = count_diverged or bool(mismatches) or orphan_md > 0
     rep = {
         "diverged": diverged,
         "md_count": md_count,
         "jsonl_count": jsonl_total,
         "jsonl_bad_lines": bad_lines,
+        "cell_check": {
+            "checked": checked,
+            "mismatches": mismatches,
+            "orphan_md_cells": orphan_md,
+        },
     }
     if diverged:
         if jsonl_total == 0 and md_count > 0:
             rep["reason"] = "legacy-md-only"
             rep["hint"] = "检测到遗留 md-only 格（map.jsonl 为空）；无需迁移，新格将同时写入两侧"
+        elif mismatches and not count_diverged:
+            rep["reason"] = "field-mismatch"
+            rep["hint"] = "格数一致但字段比对不符（cell_check.mismatches）；以 map.jsonl 为准修正 map.md 对应格"
         else:
             rep["reason"] = "count-mismatch"
             rep["hint"] = "map.md(%d 格) 与 map.jsonl(%d 行) 不一致；map.jsonl 已包含全部字段(含证据/顶点原理/用户更懂)，可据其无损重建 map.md" % (
@@ -168,7 +267,11 @@ def _selftest_writer(gzx_dir):
         return False, "writer not found"
     try:
         if os.name == "nt":
-            bash_bin = shutil.which("bash") or r"C:\Program Files\Git\bin\bash.exe"
+            # 共享探测（gzx_lock_append.find_git_bash）：先固定安装位，which 结果
+            # 须为 MINGW/MSYS——which("bash") 裸用可能选中 WSL bash（grok #3054 A-7）
+            bash_bin = find_git_bash()
+            if bash_bin is None:
+                return False, "no usable bash (MINGW/MSYS) on Windows"
             cmd = [bash_bin, writer_sh, "badtarget"]
         else:
             cmd = [writer_sh, "badtarget"]
@@ -242,12 +345,42 @@ def cmd_preflight(gzx_dir):
     return 0
 
 
-def cmd_cell(gzx_dir, concept):
+def cmd_cell(gzx_dir, concept, tier=None):
+    """读格。同一概念在 map.md/jsonl 里跨多个分层时（dsh #3055 §5-1 的跨层
+    last-wins 取错格问题）不静默返回，报歧义（退出码 25）并附分层候选；
+    需要精确取格用 cell <概念> <分层>。"""
     map_rows, _, _ = _parse_jsonl(os.path.join(gzx_dir, "map.jsonl"))
-    latest = None
-    for row in map_rows:
-        if row.get("概念") == concept:
-            latest = row
+    rows = [r for r in map_rows if r.get("概念") == concept]
+    if tier is not None:
+        latest = None
+        for r in rows:
+            if r.get("分层") == tier:
+                latest = r
+        md_sec = _extract_md_section(os.path.join(gzx_dir, "map.md"), concept, tier)
+        print(json.dumps({
+            "概念": concept,
+            "分层": tier,
+            "jsonl_latest": latest,
+            "md_section": md_sec,
+        }, ensure_ascii=False, indent=2))
+        return 0
+
+    tiers = []
+    for r in rows:
+        t = r.get("分层", "")
+        if t not in tiers:
+            tiers.append(t)
+    if len(tiers) > 1:
+        print(json.dumps({
+            "概念": concept,
+            "ambiguous": True,
+            "分层候选": tiers,
+            "jsonl_latest": None,
+            "md_section": None,
+            "hint": "同一概念存在多个分层；用 cell <概念> <分层> 精确取格",
+        }, ensure_ascii=False, indent=2))
+        return 25
+    latest = rows[-1] if rows else None
     md_sec = _extract_md_section(os.path.join(gzx_dir, "map.md"), concept)
     print(json.dumps({
         "概念": concept,
@@ -401,9 +534,10 @@ def main(argv=None):
         return cmd_preflight(gzx_dir)
     if sub == "cell":
         if len(args) < 2:
-            sys.stderr.write("usage: gzx_cli.py cell <concept>\n")
+            sys.stderr.write("usage: gzx_cli.py cell <概念> [分层]\n")
             return 21
-        return cmd_cell(gzx_dir, " ".join(args[1:]))
+        tier = args[2] if len(args) > 2 else None
+        return cmd_cell(gzx_dir, " ".join(args[1:2]), tier)
     if sub == "save-cell":
         return cmd_save_cell(gzx_dir)
     if sub == "pending-add":
