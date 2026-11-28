@@ -834,6 +834,13 @@ def _handle(event):
 
 
 def selftest():
+    # 自检是测试入口：Windows CI 运行器控制台编码非 UTF-8（cp1252 实测），本函数
+    # 打印中文 SKIP/FAIL 行即 UnicodeEncodeError。输出强制 UTF-8，与控制台无关。
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     _pkg_skill = _posix_form(_plugin_skill_dir())
     allows = [
         "sha256sum ~/.gan-zhong-xue/map.md",
