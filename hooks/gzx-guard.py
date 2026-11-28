@@ -13,6 +13,7 @@ v1.2.0 收窄范围判据：不再以泛化的 "gan-zhong-xue" 字样触发拦�
 不分析「谁执行谁」（launcher 任意嵌套，位置分析无界），不维护解释器选项表。
 """
 
+import fnmatch
 import json
 import os
 import re
@@ -148,22 +149,24 @@ def _lex(s):
         buf = []
         quoted = False
         subst = False
-        q = None            # 当前引号：None / "'" / '"'
-        depth = 0           # 未闭合的 $( 与其内 ( 的层数
-        ticks = 0           # 是否在反引号内
+        qstack = []        # 未闭合的引号栈：[(引号字符, 开引号时的 $( 嵌套层数)]
+        depth = 0          # 未闭合的 $( 与其内 ( 的层数
+        ticks = 0          # 是否在反引号内
         while i < n:
             c = s[i]
             nxt = s[i + 1] if i + 1 < n else ""
-            if q == "'":
+            q = qstack[-1] if qstack else None
+            if q and q[0] == "'":
+                # 单引号里一切字面（含反斜杠与 $(），直到下一个单引号
                 if c == "'":
-                    q = None
+                    qstack.pop()
                 else:
                     buf.append(c)
                 i += 1
             elif c == "\\":
                 if nxt == "\n":                      # 续行
                     i += 2
-                elif q == '"':
+                elif q and q[0] == '"':
                     if nxt and nxt in '$`"\\':       # 双引号内只有这五个字符可被转义
                         buf.append(nxt)
                         i += 2
@@ -175,16 +178,19 @@ def _lex(s):
                     i += 2
                 else:
                     return None, "unparseable"
-            elif c == "'" and q is None:
-                q = "'"
+            elif c == "'":
+                qstack.append(("'", depth))
                 quoted = True
                 i += 1
             elif c == '"':
-                if q == '"':
-                    q = None
+                quoted = True
+                if q and q[0] == '"':
+                    if q[1] < depth:
+                        qstack.append(('"', depth))   # $() 里另起的一层双引号
+                    else:
+                        qstack.pop()                  # 闭合
                 else:
-                    q = '"'
-                    quoted = True
+                    qstack.append(('"', depth))
                 i += 1
             elif c == "`":
                 buf.append(c)
@@ -202,14 +208,16 @@ def _lex(s):
                     depth += 1
                     i += 2
             elif depth > 0 or ticks:
-                if not ticks:
+                # $() 里、当前这层嵌套上没被引号包住的括号才改嵌套层数：
+                # 外层开的引号管不到 $() 里面（"$(rm x)"），$() 里另起的引号才管得到（"$(echo "a)b")"）
+                if not ticks and (not qstack or qstack[-1][1] < depth):
                     if c == "(":
                         depth += 1
                     elif c == ")":
                         depth -= 1
                 buf.append(c)
                 i += 1
-            elif q == '"':
+            elif q and q[0] == '"':
                 buf.append(c)
                 i += 1
             elif c in _WS or c == "\n" or c in _CTRL:
@@ -217,7 +225,7 @@ def _lex(s):
             else:
                 buf.append(c)
                 i += 1
-        if i >= n and (q is not None or depth or ticks):
+        if i >= n and (qstack or depth or ticks):
             return None, "unparseable"
         items.append(_Tok("w", "".join(buf), start, i, quoted, subst))
     return items, None
@@ -330,11 +338,11 @@ def _resolve_bare(name):
     return None, dot_before
 
 
-def _identity_ok(path, name, provable=True):
+def _identity_ok(path, name):
     """path 是否精确等于官方名 name 的固定位。
     赋值前缀（W=…）先剥掉；带分隔符 / 带空白的路径按规范化路径精确相等；
-    裸写入器名只可能是**命令名**（参数位上的裸名在调用处已一律拒，见 _gates），
-    按 PATH 解析到官方位才算数，provable=False（命令自带 PATH= 前缀）时不可证；
+    裸写入器名只可能是**命令名**（参数位上的裸名在调用处已一律拒，见 _scan_names），
+    按 PATH 解析到官方位才算数（PATH 里排在它前面的「当前目录项」会使解析不可证）；
     裸 CLI 名按当前目录解析（python 打开脚本就是相对当前目录）。"""
     m = _ENV_ASSIGN_RE.match(path)
     if m:
@@ -343,8 +351,6 @@ def _identity_ok(path, name, provable=True):
         return False
     official = _cli_official_path() if name == CLI_FILENAME else _writer_installed_path()
     if name != CLI_FILENAME and not any(c in path for c in "/\\ \t"):
-        if not provable:
-            return False
         w, dot_before = _resolve_bare(path)
         return bool(w) and not dot_before and _canon_path(w) == official
     return _canon_path(path) == official
@@ -393,6 +399,21 @@ def _is_launcher_cmd(name):
 def _has_path_assign(words):
     """命令里是否有 PATH=… 赋值词（含 env 的 PATH=… 参数）。"""
     return any(_PATH_ASSIGN_RE.match(t.text) for t in words)
+
+
+_BRACE_EXPAND_RE = re.compile(r"\{[^{}]*,|\{[^{}]*\.\.")
+
+
+def _may_hide_exec_flag(t):
+    """find 命令里的词是否可能展开成一个 exec 族旗标：命令替换、`$` 变量、花括号展开
+    （`{a,-exec}`），或通配模式能匹配旗标名（`?exec`、`*`——当前目录里有个叫 -exec 的文件
+    就成立）。`*.py`、`*.md` 这类匹配不上旗标名的不算。"""
+    text = t.text
+    if t.subst or "$" in text or "`" in text or _BRACE_EXPAND_RE.search(text):
+        return True
+    if any(ch in text for ch in "*?["):
+        return any(fnmatch.fnmatchcase(flag, text) for flag in _FIND_EXEC_FLAGS)
+    return False
 
 
 def _parse_redirects(block):
@@ -569,18 +590,29 @@ def _gates(cmds):
             items, scan_head = c["toks"], head
         elif name == "find":
             # find 的 -exec / -execdir / -ok / -okdir 会执行一个程序，且被执行的就是紧跟旗标的那个词
-            # （位置确定，没有选项值的问题）。只查这个程序本身；它是启动器时，后面的参数才可能
-            # 被执行，一并查。`find . -name gzx_cli.py`、`find . -exec grep -l gzx-append {} \;` 里
-            # 官方名只是搜索模式 / 数据，不查（claude #3074 §2）。
-            k = next((i for i, w in enumerate(c["words"]) if w.text in _FIND_EXEC_FLAGS), None)
-            if k is None or k + 1 >= len(c["words"]):
-                continue
-            util = c["words"][k + 1]
-            if _is_launcher_cmd(_cmd_name(util.text)):
-                items = c["words"][k + 1:]
-            else:
-                items = [util]
+            # （位置确定，没有选项值的问题）。每一个 exec 段都要查，不能只看第一个
+            # （Bugbot 4728242786：`-exec true {} \; -exec bash /tmp/evil/…`）。每段只查程序本身；
+            # 它是启动器时，后面的参数才可能被执行，一并查。`find . -name gzx_cli.py`、
+            # `find . -exec grep -l gzx-append {} \;` 里官方名只是搜索模式 / 数据，不查（claude #3074 §2）。
+            # 命令里既有「可能展开成 exec 旗标」的词、又出现了官方名时，旗标可能藏在里面 ⇒
+            # 命令名之后的词整段都查；没有官方名就没什么可保护，不查。
+            words = c["words"]
             scan_head = None
+            rest = words[1:]
+            if (any(_may_hide_exec_flag(t) for t in rest)
+                    and any(_name_hit(t.text) is not None for t in rest)):
+                items = rest
+            else:
+                idxs = [i for i, w in enumerate(words) if w.text in _FIND_EXEC_FLAGS]
+                items = []
+                for n, k in enumerate(idxs):
+                    end = idxs[n + 1] if n + 1 < len(idxs) else len(words)
+                    seg = words[k + 1:end]
+                    if not seg:
+                        continue
+                    items.extend(seg if _is_launcher_cmd(_cmd_name(seg[0].text)) else seg[:1])
+                if not items:
+                    continue
         elif _is_launcher_cmd(name):
             items, scan_head = c["toks"], head
         else:
@@ -1104,6 +1136,9 @@ def selftest():
         "find . -name '*.md'",
         "find . -name '*.md' -exec grep -l gzx-append {} \\;",     # 官方名只是搜索模式
         "grep -rl gzx-append .",
+        "find . -name gzx_cli.py -o -name '*.py'",
+        "find . -name gzx_cli.py -exec grep -n import {} \\;",
+        "find . -exec true {} \\; -exec grep -l gzx-append {} \\;",
         "python3 '%s/gzx_cli.py' cell 'Foo Bar'" % _pkg_skill,     # 官方件自己的参数可带空格
     ]
     denies = [
@@ -1269,6 +1304,17 @@ def selftest():
         ("find . -exec gzx-append.sh map {} \\;", "identity:gzx-append.sh"),
         # 已申报代价：xargs 分不清选项值与程序（xargs -n 1 …），命令里的官方名一律按被执行处理
         ("xargs grep -l gzx-append", "identity:gzx-append"),
+        # find：每一个 exec 段都查（Bugbot 4728242786：拿无害的第一段当幌子藏住第二段）；
+        # 可能展开成旗标的词（变量、?exec、*）出现且提到官方名 ⇒ 整段按执行处理
+        ("find . -exec true {} \\; -exec bash /tmp/evil/gzx-append.sh map {} \\;",
+         "identity:gzx-append.sh"),
+        ("find . -name x -exec grep -l foo {} + -exec python3 /tmp/evil/gzx_cli.py save-cell {} \\;",
+         "identity:gzx_cli.py"),
+        ("find . -name x -okdir sh /tmp/evil/gzx-append.sh map {} \\;", "identity:gzx-append.sh"),
+        ("find . -exec sh -c 'bash /tmp/evil/gzx-append.sh map' {} \\;", "payload:gzx-append.sh"),
+        ("find . -name ?exec bash /tmp/evil/gzx-append.sh map", "identity:gzx-append.sh"),
+        ("find . -name '{a,-exec}' bash /tmp/evil/gzx-append.sh map", "identity:gzx-append.sh"),
+        ("find . -name '*' -exec grep -l gzx-append {} \\;", "identity:gzx-append"),
         ("bash -c 'cat ~/.gan-zhong-xue/map.md'", "prefix:bash"),
         # ── 引导与数据目录直写（基线）──
         ("cp /tmp/gzx-append ~/.gan-zhong-xue/map.md", "prefix:cp"),

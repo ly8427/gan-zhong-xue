@@ -197,6 +197,10 @@ LEX_ROWS = [
     (r'echo "`rm x`"', ["echo", "`rm x`"]),
     (r"echo '$(rm x)'", ["echo", "$(rm x)"]),
     (r"echo '$x'", ["echo", "$x"]),
+    # 命令替换里的引号：引号内的括号不改嵌套层数（整个命令替换是一个词）
+    (r'echo "$(echo "a)b")"', ["echo", "$(echo a)b)"]),
+    (r"cat $(echo 'x)y')z", ["cat", "$(echo x)y)z"]),
+    (r"find . -name x -exec true {} \;", ["find", ".", "-name", "x", "-exec", "true", "{}", ";"]),
     # ── 注释（词首 #）与其余 ──
     (r"echo a#b # comment ; rm x", ["echo", "a#b"]),
     (r"ls ~/.gan-zhong-xue # see ~/.gan-zhong-xue/map.md", ["ls", "~/.gan-zhong-xue"]),
@@ -353,10 +357,15 @@ WRAPPERS_SH = [
     "ionice -c 3 bash {t} map",
     # 启动器链首的「第一个位置参数不是程序」：官方件会被当参数、执行后面的程序
     "script -q {t} bash {E}/plain.sh", "flock {t} bash {E}/plain.sh",
-    # find -exec 族（claude #3074 §2）：{{}} 是格式串里的字面花括号
+    # find -exec 族（claude #3074 §2）：{{}} 是格式串里的字面花括号；-name 用官方件名当匹配模式，
+    # 这样一旦被误放行，在假件目录里就会真的执行到
     "find . -name x -exec bash {t} map {{}} \\;",
     "find . -name x -execdir bash {t} map {{}} +",
     "find . -name x -ok python3 {t} save-cell {{}} \\;",
+    "find . -name gzx-append.sh -exec bash {t} map {{}} \\;",
+    "find . -name x -exec true {{}} \\; -exec bash {t} map {{}} \\;",
+    "find . -name x -exec grep -l foo {{}} + -exec python3 {t} save-cell {{}} \\;",
+    "find . -name ?exec bash {t} map",
     # 启动器直接包着裸名（不经 shell 解释器）——参数位的裸名同样不可证，守卫应拒
     "env {t} map", "sudo -n {t} map", "command {t} map", "exec {t} map", "time {t} map",
     "nohup {t} map", "timeout 5 {t} map", "nice {t} map", "xargs -n1 {t} map",
@@ -616,6 +625,9 @@ def test_behavior(g, bash, work):
             "find . -name gzx_cli.py",
             "find . -name '*.py' -exec python3 -m py_compile {} \\;",
             "find . -name '*.md' -exec grep -l gzx-append {} \\;",     # 官方名只是搜索模式
+            "find . -name gzx_cli.py -o -name '*.py'",
+            "find . -name gzx_cli.py -exec grep -n import {} \\;",
+            "find . -exec true {} \\; -exec grep -l gzx-append {} \\;",
             "git add skills/gan-zhong-xue/gzx_cli.py",
             "git commit -m 'touch gzx_cli.py'",
             "echo see gzx-append",
@@ -737,6 +749,7 @@ def test_behavior(g, bash, work):
             decoy_arg[0][0], decoy_arg[1][0],      # 陪衬官方名：别的程序直写诱饵
             decoy_arg[11][0],                      # 贴在选项上的载荷（dsh #3075 §2）
             "fakeroot bash %s/gzx-append.sh map" % e_posix,
+            "find . -name gzx-append.sh -exec bash %s/gzx-append.sh map {} \\;" % e_posix,
         ]
         names = ("_identity_ok", "_is_launcher_cmd", "_name_hit", "_has_expansion",
                  "_official_chunk_clean")
