@@ -52,7 +52,8 @@
 ## 机制层（v1.2.0）：append-only 不靠模型自觉
 
 - **聚合 CLI `gzx_cli.py` + 写入器 `gzx-append.sh`**：预检（`preflight`）、发散检测与双地图落盘（`save-cell`）收口到确定性 CLI，由 `gzx_lock_append.py` 在同一把排他锁内**互斥追加** `map.jsonl` 与 `map.md`（单写者互斥；**非跨文件事务原子**）；锁不可用**拒绝写并报错**（不静默降级）。
-- **兜底 hook（Claude Code）**：PreToolUse 拦"绕过写入器直写 `~/.gan-zhong-xue/`"的命令。判定在分词之后进行：写到数据目录的目标与要执行的程序名必须是**字面**（含 `$` 变量、`` ` ``、`*?[` 等展开算子一律拒，规则 `expansion:unprovable`——此闸与是否提及数据目录无关）；同仓开发与普通 `Agent`/文档编辑不误伤（名字臂只认执行位）；deny 与放行都落一行**本地审计**（不含命令原文）。hook 是**减速带不是安全边界**——`cd` 过去不提名字的写法拦不住，`bash -c '…'` 的载荷字符串不审计。
+- **兜底 hook（Claude Code）**：PreToolUse 拦"绕过写入器直写 `~/.gan-zhong-xue/`"的命令。判定只问两件能可靠回答的事：①这条命令的命令名是不是"会启动程序的类型"（shell / 解释器 / 常见启动器的封闭清单）；②命令里任何位置有没有出现官方写入器或 CLI 的名字。两条都是，那个名字的完整路径就必须精确等于官方安装位，否则拒——`bash /tmp/evil/gzx-append.sh`、`python3 -x /x/gzx_cli.py`、`env nice bash …` 一律拒，与选项、引号、冒号、启动器嵌套无关。另外，写到数据目录的重定向目标与命令名必须是**字面**（含 `$` 变量、`` ` ``、`*?[` 等展开算子一律拒，规则 `expansion:unprovable`，与是否提及数据目录无关）。同仓开发（`git add`/`cp`/`vim` 这类命令名不是启动器）与普通 `Agent`/文档编辑不误伤；deny 与放行都落一行**本地审计**（不含命令原文）。
+- **hook 是减速带，不是安全边界——两条防线分开说**：**手滑面**（模型自己写错命令）靠名字 / 路径判据 + 自检 + 行为反例测试兜得住；**对抗面**（提示注入刻意绕过）字符串判据**不承诺完备**——完全不出现官方名与数据目录的写法（`bash /tmp/x.sh`、`cd ~/.gan-zhong-xue` 后 `rm map.md`）拦不住。已知代价与边界逐条列在 [docs/mechanism.md](docs/mechanism.md)，每条都配了一对自检用例。
 - **提交静默捕获**：git commit 后静默往 `candidates.jsonl` 记一笔（支持 `root-commit`、`detached HEAD` 与 `cd`/`-C` 目标仓库追踪；只有 sha 与增删行数，无路径无仓名）；**已知边界：`cd $VAR` 与 `cd -` 形态的目标仓库不追踪（漏报方向，不误记）**；提醒只在下次你主动唤起 skill 时出现——不打断你的工作。
 - **宿主差异如实说**：Claude Code 插件自带 hooks 接线；**ZCode 侧只有机制层（写入器/CLI），没有兜底 hook**——ZCode 的 hook 机制存在但配置面不同，尚未接线实测。两宿主能力**不等价**，不宣称等价。
 - 验收标准与机制边界见 [docs/mechanism.md](docs/mechanism.md)；matcher 可达性仍是**待验证配置**（`hooks/matcher.json`），实测前不作任何承诺。
