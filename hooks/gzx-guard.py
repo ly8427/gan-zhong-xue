@@ -68,15 +68,27 @@ _EXPANSION_CHARS = "*?[]{}$`"
 
 # ── 启动器封闭清单（board #129 重写计划 v2；清单外 = 已声明边界，见 README）──
 _SHELL_FAMILY = {"bash", "sh", "zsh", "dash", "ksh", "source", "."}
-_INTERP_FAMILY = {"python", "python3", "perl", "ruby", "node"}
+_INTERP_FAMILY = {"python", "python3", "py", "pythonw", "pypy3", "perl", "ruby", "node"}
 _PY_VERSIONED_RE = re.compile(r"^python\d+(\.\d+)*$")   # python3.12 / python2 一类同名解释器
 _LAUNCHER_FAMILY = {
     "env", "nice", "nohup", "setsid", "stdbuf", "timeout", "sudo", "su", "doas",
     "xargs", "command", "exec", "builtin", "time", "script", "watch", "busybox",
     "strace", "ltrace", "chroot", "pkexec",
+    # dsh #3075 §3 点名的同族：都能启动一个文件
+    "fakeroot", "unshare", "flock", "taskset", "nsenter", "runuser", "sg",
+    "systemd-run", "chrt", "ionice",
 }
 # 会把「脚本文件参数」当程序执行的命令（命令名在该段的词之后，参数必须字面）
 _SCRIPT_RUNNERS = _SHELL_FAMILY | _INTERP_FAMILY
+# 可以出现在「启动器链」里、官方件允许紧跟其后的名字。排除掉第一个位置参数**不是**要执行的
+# 程序的那些：script（输出文件）、flock（锁文件）、su / runuser（用户）、sg（组）、chroot（新根）、
+# timeout（时长）、taskset（掩码）、chrt（优先级）、busybox / builtin（内建名）——否则
+# `flock <官方件> bash /tmp/evil.sh` 这类会把官方件当参数、执行后面的程序。
+_NON_PROGRAM_FIRST = {"script", "flock", "su", "runuser", "sg", "chroot", "timeout",
+                      "taskset", "chrt", "busybox", "builtin"}
+_CHAIN_LAUNCHERS = (_SCRIPT_RUNNERS | _LAUNCHER_FAMILY) - _NON_PROGRAM_FIRST
+# find 的 -exec 族会执行一个程序：find 命令块只扫第一个此类旗标之后的词（claude #3074 §2）
+_FIND_EXEC_FLAGS = {"-exec", "-execdir", "-ok", "-okdir"}
 _WRITER_BASENAMES = (WRITER_MARK, WRITER_MARK + ".sh")
 _NAME_BASENAMES = set(_WRITER_BASENAMES) | {CLI_FILENAME}
 _NAME_ORDER = (WRITER_MARK + ".sh", WRITER_MARK, CLI_FILENAME)   # 长名在前
@@ -448,31 +460,90 @@ def _structure_rule(op):
     return "structure:" + ("\\n" if op == "\n" else op)
 
 
+def _is_chain_launcher(name):
+    return (name in _SCRIPT_RUNNERS or _PY_VERSIONED_RE.match(name) is not None
+            or name in _CHAIN_LAUNCHERS)
+
+
 def _official_chunk_clean(c):
-    """靠官方名放行的启动器命令块是否干净。命令名位置起到**第一个在命令词里的官方名**之间，
-    只允许启动器名、选项、io 号、字面赋值这类不可能是「另一个程序」的词；这段里若还有别的
-    程序（带空白的程序串、含扩展算子或命令替换的词）或对数据目录的引用 ⇒ 不放行。
-    Bugbot 4728123561：官方路径当陪衬参数，会让 env / sudo / timeout / bash -c 借官方名
-    过前缀检查直写数据目录（`env tee <数据目录>/map.md <官方写入器>`）。官方名之后的词是
-    官方件自己的参数，不受此限。"""
+    """靠官方名放行的启动器命令块，官方件必须**紧跟启动器链**：从命令名位置起到第一个在
+    命令词里的官方名之间，只允许出现启动器链里的**裸名**（封闭清单）与字面赋值词
+    （NAME=字面值：无空白、无扩展算子、无命令替换、无反斜杠）。官方名之前夹着任何别的东西——
+    选项、选项值、别的程序、带路径的启动器、带引号的程序串——都说明「被执行的可能不是
+    官方件」⇒ 不给豁免，照跑前缀检查。
+
+    为什么按「能力」而不按「字符」过滤：官方名在固定位只证明这个名字不是假件，不证明它就是
+    被执行的那一个。字符过滤（只查空白 / 扩展算子）挡不住贴在选项上的载荷——
+    `python3 -c'exec(open("/tmp/p").read())' <官方件>` 整段没有空白与 $，却是任意代码执行
+    （dsh #3075 §2）。这里只认「这一段里没有一个词可能是程序或代码」：链里的名字还必须是裸名
+    （`/tmp/evil/bash` 叫 bash，却是未知程序）。判错的后果只会是多拒（如 `python3 -W ignore
+    <官方 CLI>` 被保守拒绝），不会是误放。
+
+    Bugbot 4728123561 / 4728174715：官方路径当陪衬参数，`env tee <数据目录>/map.md <官方写入器>`、
+    `sudo tee <官方写入器>` 会借官方名过前缀检查直写数据目录。官方名之后的词是官方件自己的
+    参数，不受此限（官方件自己会校验参数；`env <官方件> tee …` 执行的是官方件）。"""
     words = c["words"]
     head_i = next((i for i, w in enumerate(words) if w is c["head"]), 0)
     first = next((k for k in c["official_at"] if k >= head_i), None)
     if first is None:
         return False        # 官方名只在赋值前缀 / 重定向操作数里：被执行的不是官方件
     for t in words[:first]:
-        if t.subst or _has_ws(t.text) or _has_expansion(t.text) or _in_scope(t.text):
-            return False
+        if ("/" not in t.text and "\\" not in t.text
+                and _is_chain_launcher(_cmd_name(t.text))):
+            continue        # 启动器链里的名字必须是裸名：/tmp/evil/bash 叫 bash，却是未知程序
+        if (_ENV_ASSIGN_RE.match(t.text) and not t.subst and not _has_ws(t.text)
+                and not _has_expansion(t.text) and "\\" not in t.text):
+            continue        # 字面赋值（env FOO=bar … / FOO=bar bash …）
+        return False
     return True
+
+
+def _scan_names(items, head, c):
+    """闸三的官方名扫描：items 里任何位置的官方名都必须在固定位。
+    head=本块的命令名词元（裸写入器名只在它这个位置可信）；head=None 表示扫的是 find -exec
+    之后的词（那里没有可信的命令名位）。返回 (deny Decision 或 None, 是否有官方名核实通过)。"""
+    passed = False
+    for t in items:
+        if t.kind != "w":
+            continue
+        if t.subst:
+            # 命令替换里的名字（bash $(echo /x/gzx-append.sh)）：整词不可能等于固定位
+            name = _name_substring(_SUBST_RE.sub(" ", t.text))
+            if name:
+                return Decision(False, "identity:" + name), passed
+            continue
+        hit = _name_hit(t.text)
+        if hit is None:
+            continue
+        if hit[0] == "payload":
+            return Decision(False, "payload:" + hit[2]), passed
+        bare_writer = (hit[2] != CLI_FILENAME
+                       and not any(ch in hit[1] for ch in "/\\ \t"))
+        if bare_writer and (t is not head or _has_path_assign(c["words"])):
+            # 裸写入器名只在命令名位可信。参数位上一律拒——实测 bash/sh 找脚本参数
+            # 时**先看当前目录再看 PATH**（python 则只看当前目录），当前目录里的同名
+            # 假件会遮住 PATH 上的官方件；命令自带 PATH= 前缀时守卫也看不到那个 PATH。
+            return Decision(False, "identity:" + hit[2]), passed
+        if not _identity_ok(hit[1], hit[2]):
+            return Decision(False, "identity:" + hit[2]), passed
+        for k, w in enumerate(c["words"]):
+            if w is t:
+                c["official_at"].append(k)
+                break
+        passed = True
+    return None, passed
 
 
 def _gates(cmds):
     """与范围无关的三道闸（进出范围两向都拦）。返回 (deny Decision 或 None, 核实过官方名的块下标集)。
     闸一：写文件的重定向目标必须字面（落盘路径由 shell 产生即不可静态证明）。
     闸二：命令名必须完全字面；命令名带空白（引号粘合，词边界不可恢复）且含官方名 ⇒ 拒。
-    闸三：命令名是启动器类型 ⇒ 块内**任何位置**的官方名都必须在固定位；
-          名字出现在带引号的程序串里（-c 载荷等）⇒ 拒；脚本执行型命令（shell / 解释器）
-          的其余参数必须字面（带空白的引号串除外——那是程序文本 / 自由文本，不是脚本路径）。"""
+    闸三：命令名是启动器类型 ⇒ 块内**任何位置**的官方名都必须在固定位（find 命令块只扫
+          -exec 族旗标之后的词）；名字出现在带引号的程序串里（-c 载荷等）⇒ 拒；脚本执行型
+          命令（shell / 解释器）的其余参数必须字面（带空白的引号串除外——那是程序文本 /
+          自由文本，不是脚本路径）。
+    核实通过的官方名只让该块进范围（official 集）；能否免前缀检查另由 _official_chunk_clean
+    判——官方件必须紧跟启动器链。"""
     official = set()
     for ci, c in enumerate(cmds):
         for _op, tgt in _output_targets(c["redirs"]):
@@ -491,40 +562,35 @@ def _gates(cmds):
                     return Decision(False, "expansion:unprovable"), official
                 if hit is not None and not _identity_ok(hit[1], hit[2]):
                     return Decision(False, "identity:" + hit[2]), official
+        name = _cmd_name(head.text)
         if c["assign_only"]:
             if _basename(head.text).lower() not in _NAME_BASENAMES:
                 continue
-        elif not _is_launcher_cmd(_cmd_name(head.text)):
+            items, scan_head = c["toks"], head
+        elif name == "find":
+            # find 的 -exec / -execdir / -ok / -okdir 会执行一个程序，且被执行的就是紧跟旗标的那个词
+            # （位置确定，没有选项值的问题）。只查这个程序本身；它是启动器时，后面的参数才可能
+            # 被执行，一并查。`find . -name gzx_cli.py`、`find . -exec grep -l gzx-append {} \;` 里
+            # 官方名只是搜索模式 / 数据，不查（claude #3074 §2）。
+            k = next((i for i, w in enumerate(c["words"]) if w.text in _FIND_EXEC_FLAGS), None)
+            if k is None or k + 1 >= len(c["words"]):
+                continue
+            util = c["words"][k + 1]
+            if _is_launcher_cmd(_cmd_name(util.text)):
+                items = c["words"][k + 1:]
+            else:
+                items = [util]
+            scan_head = None
+        elif _is_launcher_cmd(name):
+            items, scan_head = c["toks"], head
+        else:
             continue
-        for t in c["toks"]:
-            if t.kind != "w":
-                continue
-            if t.subst:
-                # 命令替换里的名字（bash $(echo /x/gzx-append.sh)）：整词不可能等于固定位
-                name = _name_substring(_SUBST_RE.sub(" ", t.text))
-                if name:
-                    return Decision(False, "identity:" + name), official
-                continue
-            hit = _name_hit(t.text)
-            if hit is None:
-                continue
-            if hit[0] == "payload":
-                return Decision(False, "payload:" + hit[2]), official
-            bare_writer = (hit[2] != CLI_FILENAME
-                           and not any(c in hit[1] for c in "/\\ \t"))
-            if bare_writer and (t is not head or _has_path_assign(c["words"])):
-                # 裸写入器名只在命令名位可信。参数位上一律拒——实测 bash/sh 找脚本参数
-                # 时**先看当前目录再看 PATH**（python 则只看当前目录），当前目录里的同名
-                # 假件会遮住 PATH 上的官方件；命令自带 PATH= 前缀时守卫也看不到那个 PATH。
-                return Decision(False, "identity:" + hit[2]), official
-            if not _identity_ok(hit[1], hit[2]):
-                return Decision(False, "identity:" + hit[2]), official
+        d_scan, passed = _scan_names(items, scan_head, c)
+        if d_scan:
+            return d_scan, official
+        if passed:
             official.add(ci)
-            for k, w in enumerate(c["words"]):
-                if w is t:
-                    c["official_at"].append(k)
-                    break
-        if c["assign_only"] or not _is_script_runner(_cmd_name(head.text)):
+        if c["assign_only"] or not _is_script_runner(name):
             continue
         seen = False
         for t in c["words"]:
@@ -947,11 +1013,6 @@ def selftest():
         "python3 '%s/gzx_cli.py' preflight" % _pkg_skill,
         "python3 %s/gzx_cli.py preflight" % _pkg_skill,
         "python3 '%s/gzx_cli.py' cell '<概念>'" % _pkg_skill,
-        # 解释器选项不再影响判定（旧选项表写差即漏；现只问名字在不在固定位）
-        "python3 -W ignore '%s/gzx_cli.py' preflight" % _pkg_skill,
-        "python3 -X dev '%s/gzx_cli.py' preflight" % _pkg_skill,
-        "python3 --check-hash-based-pycs default '%s/gzx_cli.py' preflight" % _pkg_skill,
-        "python3 -- '%s/gzx_cli.py' preflight" % _pkg_skill,
         "python.exe '%s' preflight" % _cli_native,
         ("python3 '%s/gzx_cli.py' save-cell <<'GZX_JSON_EOF'\n"
          '{"概念":"~/.gan-zhong-xue 范围测试","分层":"🟡","来源":"🟢自","先猜":"猜","验证题":"题","状态":"待复验"}\n'
@@ -963,8 +1024,8 @@ def selftest():
         ("gzx-append pending-clear", "writer-on-path"),
         # 启动器链 + 官方写入器的**路径**形态
         "env ~/.gan-zhong-xue/gzx-append.sh map",
-        "sudo -n ~/.gan-zhong-xue/gzx-append.sh map",
-        "timeout 5 ~/.gan-zhong-xue/gzx-append.sh map",
+        "env FOO=bar bash ~/.gan-zhong-xue/gzx-append.sh map",
+        "sudo ~/.gan-zhong-xue/gzx-append.sh map",
         "command ~/.gan-zhong-xue/gzx-append.sh map",
         "exec ~/.gan-zhong-xue/gzx-append.sh map",
         "source ~/.gan-zhong-xue/gzx-append.sh map",
@@ -1035,8 +1096,14 @@ def selftest():
         "sudo bash $SCRIPT map",                      # 泛启动器后的非字面参数不查
         "rm map.md",                                  # cd 进数据目录后不提名字
         "bash /tmp/evil.sh",                          # 完全不出现官方名与数据目录的脚本
-        # 被执行的是不带官方名的脚本、官方路径只当参数（等价于上一条，已申报边界）
-        "env bash /tmp/evil.sh ~/.gan-zhong-xue/gzx-append.sh",
+        # 清单外启动器 / 执行器（已申报边界；每条与下方一条 deny 配对）
+        "docker exec box bash /tmp/evil/gzx-append.sh map",
+        "ssh host bash /tmp/evil/gzx-append.sh map",
+        "awk '{print}' gzx_cli.py",
+        "find . -name gzx_cli.py",
+        "find . -name '*.md'",
+        "find . -name '*.md' -exec grep -l gzx-append {} \\;",     # 官方名只是搜索模式
+        "grep -rl gzx-append .",
         "python3 '%s/gzx_cli.py' cell 'Foo Bar'" % _pkg_skill,     # 官方件自己的参数可带空格
     ]
     denies = [
@@ -1160,6 +1227,48 @@ def selftest():
          "prefix:python3"),
         ("env python3 '%s/gzx_cli.py' check <(tee ~/.gan-zhong-xue/map.md)" % _pkg_skill,
          "structure:<("),
+        # dsh #3075 §2 判别用例：字符过滤挡不住的「贴在选项上的载荷」——按能力判，不给豁免
+        ("python3 -c'exec(open(\"/tmp/p\").read())' ~/.gan-zhong-xue/gzx-append.sh", "prefix:python3"),
+        ("sudo -n tee x ~/.gan-zhong-xue/gzx-append.sh", "prefix:sudo"),
+        ("sudo -n sh -c 'printf x >> ~/.gan-zhong-xue/map.md' ~/.gan-zhong-xue/gzx-append.sh",
+         "prefix:sudo"),
+        # 官方件前面夹了选项 / 选项值 / 别的程序 ⇒ 不给豁免（已申报代价；官方写法不带选项）
+        ("python3 -W ignore '%s/gzx_cli.py' preflight" % _pkg_skill, "prefix:python3"),
+        ("python3 -X dev '%s/gzx_cli.py' preflight" % _pkg_skill, "prefix:python3"),
+        ("python3 --check-hash-based-pycs default '%s/gzx_cli.py' preflight" % _pkg_skill,
+         "prefix:python3"),
+        ("python3 -- '%s/gzx_cli.py' preflight" % _pkg_skill, "prefix:python3"),
+        ("sudo -n ~/.gan-zhong-xue/gzx-append.sh map", "prefix:sudo"),
+        ("timeout 5 ~/.gan-zhong-xue/gzx-append.sh map", "prefix:timeout"),
+        ("env -i bash ~/.gan-zhong-xue/gzx-append.sh map", "prefix:env"),
+        ("env bash /tmp/evil.sh ~/.gan-zhong-xue/gzx-append.sh", "prefix:env"),
+        # 启动器链里排除掉「第一个位置参数不是程序」的名字：官方件会被当参数、执行后面的程序
+        ("script ~/.gan-zhong-xue/gzx-append.sh", "prefix:script"),
+        ("script -q ~/.gan-zhong-xue/gzx-append.sh bash /tmp/evil.sh", "prefix:script"),
+        ("flock ~/.gan-zhong-xue/gzx-append.sh bash /tmp/evil.sh", "prefix:flock"),
+        ("timeout ~/.gan-zhong-xue/gzx-append.sh map", "prefix:timeout"),
+        ("busybox ~/.gan-zhong-xue/gzx-append.sh map", "prefix:busybox"),
+        # dsh #3075 §3：清单外启动器曾整族不扫——现补进名单（claude #3074 §2 的 find -exec 同此）
+        ("fakeroot bash gzx-append.sh map", "identity:gzx-append.sh"),
+        ("unshare -r bash /tmp/evil/gzx-append.sh map", "identity:gzx-append.sh"),
+        ("flock /tmp/lock bash /tmp/evil/gzx-append.sh map", "identity:gzx-append.sh"),
+        ("taskset -c 0 python3 /tmp/evil/gzx_cli.py save-cell", "identity:gzx_cli.py"),
+        ("nsenter -t 1 bash /tmp/evil/gzx-append.sh map", "identity:gzx-append.sh"),
+        ("runuser -u root -- bash /tmp/evil/gzx-append.sh map", "identity:gzx-append.sh"),
+        ("sg root -c 'bash /tmp/evil/gzx-append.sh map'", "payload:gzx-append.sh"),
+        ("systemd-run bash /tmp/evil/gzx-append.sh map", "identity:gzx-append.sh"),
+        ("chrt -f 99 bash /tmp/evil/gzx-append.sh map", "identity:gzx-append.sh"),
+        ("ionice -c 3 bash /tmp/evil/gzx-append.sh map", "identity:gzx-append.sh"),
+        ("py /tmp/evil/gzx_cli.py save-cell x", "identity:gzx_cli.py"),
+        ("find . -name '*.py' -exec python3 /tmp/evil/gzx_cli.py save-cell {} \\;", "identity:gzx_cli.py"),
+        ("find . -exec bash /tmp/evil/gzx-append.sh map {} \\;", "identity:gzx-append.sh"),
+        ("find . -execdir gzx-append.sh map {} +", "identity:gzx-append.sh"),
+        ("find . -name gzx_cli.py -ok python3 /tmp/evil/gzx_cli.py save-cell {} \\;",
+         "identity:gzx_cli.py"),
+        ("find . -exec /usr/bin/env bash /tmp/evil/gzx-append.sh map {} \\;", "identity:gzx-append.sh"),
+        ("find . -exec gzx-append.sh map {} \\;", "identity:gzx-append.sh"),
+        # 已申报代价：xargs 分不清选项值与程序（xargs -n 1 …），命令里的官方名一律按被执行处理
+        ("xargs grep -l gzx-append", "identity:gzx-append"),
         ("bash -c 'cat ~/.gan-zhong-xue/map.md'", "prefix:bash"),
         # ── 引导与数据目录直写（基线）──
         ("cp /tmp/gzx-append ~/.gan-zhong-xue/map.md", "prefix:cp"),

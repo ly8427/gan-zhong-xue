@@ -346,6 +346,17 @@ WRAPPERS_SH = [
     "strace -f bash {t} map", "doas bash {t} map", "pkexec bash {t} map", "chroot / bash {t} map",
     "sudo -n env nice -n 5 timeout 5 bash {t} map", "env -i bash {t} map",
     "bash.exe {t} map",
+    # dsh #3075 §3 点名的同族启动器（此前不在名单里，带官方名也不扫）
+    "fakeroot bash {t} map", "unshare -r bash {t} map", "flock /tmp/lock bash {t} map",
+    "taskset -c 0 bash {t} map", "nsenter -t 1 bash {t} map", "runuser -u root -- bash {t} map",
+    "sg root -c 'bash {t} map'", "systemd-run bash {t} map", "chrt -f 99 bash {t} map",
+    "ionice -c 3 bash {t} map",
+    # 启动器链首的「第一个位置参数不是程序」：官方件会被当参数、执行后面的程序
+    "script -q {t} bash {E}/plain.sh", "flock {t} bash {E}/plain.sh",
+    # find -exec 族（claude #3074 §2）：{{}} 是格式串里的字面花括号
+    "find . -name x -exec bash {t} map {{}} \\;",
+    "find . -name x -execdir bash {t} map {{}} +",
+    "find . -name x -ok python3 {t} save-cell {{}} \\;",
     # 启动器直接包着裸名（不经 shell 解释器）——参数位的裸名同样不可证，守卫应拒
     "env {t} map", "sudo -n {t} map", "command {t} map", "exec {t} map", "time {t} map",
     "nohup {t} map", "timeout 5 {t} map", "nice {t} map", "xargs -n1 {t} map",
@@ -357,6 +368,7 @@ WRAPPERS_PY = [
     "perl {t}", "ruby {t}", "node {t}",
     "env python3 {t} save-cell", "sudo -n python3 {t} save-cell",
     "timeout 5 python3 {t} save-cell", "xargs -n1 python3 {t} save-cell",
+    "py {t} save-cell", "pythonw {t}", "fakeroot python3 {t} save-cell",
 ]
 # 把命令放进「带引号的程序串」的形态
 PAYLOAD_WRAPPERS = [
@@ -452,6 +464,8 @@ def test_behavior(g, bash, work):
         _write(os.path.join(d, "gzx_cli.py"), FAKE_CLI)
     _write(os.path.join(evil, "plain.sh"), PLAIN_SH, exec_bit=True)
     _write(os.path.join(evil, "plain.py"), PLAIN_PY)
+    # 不带官方名、但文件名叫 bash 的诱饵程序（带路径的同名「启动器」不能因此获得豁免）
+    _write(os.path.join(evil, "bash"), PLAIN_SH, exec_bit=True)
     py = _posix(sys.executable)
     for name in ("python3", "python", "python3.12"):
         # 解释器垫片：三个名字都转调当前解释器（Windows 商店版 python3 是起不来的别名桩）
@@ -459,6 +473,7 @@ def test_behavior(g, bash, work):
                exec_bit=True)
 
     def restore():
+        _write(os.path.join(decoy, "gzx-append.sh"), OFFICIAL_WRITER, exec_bit=True)
         _write(os.path.join(decoy, "map.md"), SENTINEL)
         _write(os.path.join(decoy, "map.jsonl"), '{"概念":"诱饵"}\n')
         _write(os.path.join(decoy, "pending.md"), "- 诱饵未挖点\n")
@@ -505,7 +520,8 @@ def test_behavior(g, bash, work):
             for w in wrappers:
                 for q, _qk in (quotes or QUOTES):
                     for pre, _pk in PREFIXES:
-                        yield pre + w.format(t=q.format(t=t)), (tk, w)
+                        yield (pre + w.format(t=q.format(t=t), E=e_posix),
+                               (tk, w.replace("{E}", "<E>")))
 
     matrix = (list(gen(targets_sh, WRAPPERS_SH + PAYLOAD_WRAPPERS))
               + list(gen(targets_py, WRAPPERS_PY))
@@ -524,6 +540,17 @@ def test_behavior(g, bash, work):
         "env bash {E}/plain.sh {D}/map.md {D}/gzx-append.sh",
         "W={D}/gzx-append.sh sudo -n tee {D}/map.md $W",
         "FOO={D}/gzx-append.sh env bash {E}/plain.sh",
+        "env -i bash {E}/plain.sh {D}/gzx-append.sh",
+        # dsh #3075 §2 判别用例：贴在选项上的载荷（整段无空白、无扩展算子）
+        "python3 -c'exec(open(\"/tmp/p\").read())' {D}/gzx-append.sh",
+        "sudo -n tee x {D}/gzx-append.sh",
+        "bash -c'cat>{D}/map.md' {D}/gzx-append.sh",
+        # Bugbot 4728174715：官方件在前 / 只带官方件——写入器本体被当输出文件
+        "sudo -n tee {D}/gzx-append.sh",
+        "sudo -n mv {D}/gzx-append.sh {D}/map.md",
+        "strace -o {D}/gzx-append.sh bash {E}/plain.sh",
+        # 带路径的「同名启动器」：/…/bash 叫 bash，却是未知程序
+        "env {E}/bash {D}/gzx-append.sh",
     ]
     decoy_arg = [(w.replace("{D}", d_posix).replace("{E}", e_posix), ("decoy-arg", w))
                  for w in DECOY_ARG]
@@ -571,9 +598,38 @@ def test_behavior(g, bash, work):
         check("B1 环境①（官方件不在 PATH）：矩阵 %d 条**全部拒**" % len(matrix), not allowed1,
               "放行 %d 条，例如 %r" % (len(allowed1), allowed1[:3]))
         da_allowed = [(c, r) for c, k, a, r in res1 if k[0] == "decoy-arg" and a]
-        check("B6 陪衬官方名族（Bugbot 4728123561）：官方路径当参数带上的 env / sudo / timeout / "
-              "bash -c %d 条**全拒**" % len(decoy_arg), not da_allowed,
+        check("B6 陪衬官方名族（Bugbot 4728123561 / 4728174715、dsh #3075 §2）：官方路径当参数、"
+              "贴在选项上的载荷、同名「启动器」等 %d 条**全拒**" % len(decoy_arg), not da_allowed,
               "放行 %d 条，例如 %r" % (len(da_allowed), da_allowed[:2]))
+        # 判据是「拒 + 规则名」，不是「没观察到写」：逐条列出规则名
+        da_rules = {}
+        for c, k, a, r in res1:
+            if k[0] == "decoy-arg":
+                da_rules[r.split(":")[0]] = da_rules.get(r.split(":")[0], 0) + 1
+        check("B6b 陪衬官方名族的拒绝都带明确规则名（prefix=不给豁免 / identity=名字不在固定位 / "
+              "payload=程序串里的官方名）：%s" % da_rules,
+              set(da_rules) <= {"prefix", "identity", "payload"} and sum(da_rules.values()) == len(decoy_arg),
+              "规则名分布 %s" % da_rules)
+
+        # ── 良性命令不得误伤（收窄启动器清单与 find 专项的对照面）──
+        benign = [
+            "find . -name gzx_cli.py",
+            "find . -name '*.py' -exec python3 -m py_compile {} \\;",
+            "find . -name '*.md' -exec grep -l gzx-append {} \\;",     # 官方名只是搜索模式
+            "git add skills/gan-zhong-xue/gzx_cli.py",
+            "git commit -m 'touch gzx_cli.py'",
+            "echo see gzx-append",
+            "cp skills/gan-zhong-xue/gzx_cli.py /tmp/x.py",
+            "vim gzx_cli.py",
+            "awk '{print NR}' gzx_cli.py",
+            "python3 hooks/test-gzx-invariants.py",
+            "flock /tmp/lock python3 -m pytest",
+            "taskset -c 0 make",
+            "fakeroot make package",
+        ]
+        ben_denied = [(c, g.classify(c).rule) for c in benign if not g.classify(c).allow]
+        check("B7 良性命令不误伤（同仓开发、find 搜索模式与 -exec 的数据参数、不提官方名的启动器命令）"
+              "%d 条全放行" % len(benign), not ben_denied, "误拒 %r" % ben_denied[:3])
 
         # ── 环境③：假写入器排在 PATH 最前 ──
         use_path(guard_path(evil))
@@ -679,6 +735,8 @@ def test_behavior(g, bash, work):
             "env bash gzx-append.sh map",          # 参数位裸名（当前目录即 evil，有同名假件）
             "python3 gzx_cli.py save-cell",
             decoy_arg[0][0], decoy_arg[1][0],      # 陪衬官方名：别的程序直写诱饵
+            decoy_arg[11][0],                      # 贴在选项上的载荷（dsh #3075 §2）
+            "fakeroot bash %s/gzx-append.sh map" % e_posix,
         ]
         names = ("_identity_ok", "_is_launcher_cmd", "_name_hit", "_has_expansion",
                  "_official_chunk_clean")
