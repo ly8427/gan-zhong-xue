@@ -4,6 +4,17 @@
 
 **响应 Issue #6（P0/P1/P2 系统性重构与修复）：聚合 CLI 收口确定性逻辑、收窄守卫误杀面、打通跨平台测试与捕获断层、瘦身 `SKILL.md` 并清零 `docs/DEBT.md` 欠账。**
 
+**评审收敛批（2026-11-28，PR #7 复审：board #129 四家增量评审 + Cursor Bugbot 两轮；实现方 zcode）**：
+
+- **守卫字面性闸（`hooks/gzx-guard.py`）**：判定挪到分词之后——有效命令名、包装器/解释器参数、输出重定向目标含 `$` 变量/命令替换/反引号/`*?[]{}` 等扩展算子一律拒（`expansion:unprovable`，与是否提及数据目录无关）；$ 碎片拼接启发式移除（三族 bypass 实证）。**已知代价**：范围外动态写目标也被拒（宁枉勿纵，README/matcher 同步声明）。
+- **守卫范围门 token 化 + heredoc 正文剥离**：范围判定从原串字面改为按词元（引号拼接 `~/.gan-zhong-""xue` 修复）；非官方 heredoc 剥离正文后进身份层（包装器/裸名假写入器形态可达，`unparseable` 默认拒）。
+- **守卫名字臂（臂③收敛形态）**：写入器/CLI 名按执行位（命令名、包装器参数、解释器脚本位）逐词 basename 相等进范围，禁全文正则；同仓 `git add`/`echo`/`git commit -m` 回归钉保持放行；包装器参数中的写入器名解析不到官方安装位一律拒（fail-closed）。
+- **cell 分层歧义（`gzx_cli.py`）**：同概念跨多分层时 `cell <概念>` 报歧义（退出码 25）不静默取格；`cell <概念> <分层>` 按 (概念,分层) 精确取格。
+- **check-divergence 升级重建+diff**：jsonl 行与 md 格按 (概念,分层) 追加序逐位配对、逐字段比对渲染面，字段不符/缺格/孤立格均报（`cell_check` 明细），退出码 24 不变。
+- **capture `);` 粘连拆分（`hooks/gzx-capture.py`）**：全标点粘连词元按复合操作符拆分，`( cd repo && git commit ); git commit` 的外层提交不再漏捕获。
+- **CLI bash 探测同口径**：`gzx_lock_append.find_git_bash()` 共享实现（固定安装位 + MINGW/MSYS 校验），CLI 自检不再可能选中 WSL bash。
+- **测试基建**：两套测试输出强制 UTF-8（Windows CI 运行器 cp1252 控制台打印中文即崩的根因）；D1 测试 python3 改 bash 垫片转调真实解释器（商店版别名桩不可复制）；裸名用例按安装态条件生效、跳过显式计；新增守卫字面性闸/名字臂/heredoc 剥离负例与 capture `);` 端到端例。
+
 - **P0 聚合 CLI 与同锁双写（`skills/gan-zhong-xue/gzx_cli.py` + `gzx_lock_append.py`）**：
   - 新增 `gzx_cli.py`（`preflight` / `cell` / `save-cell` / `pending-add` / `pending-clear` / `check-divergence`），将第 -1 步多条碎命令压缩为单次 `preflight`，并在单锁 `lock_append_map_pair` 内实现 `map.jsonl` 与 `map.md` 的同锁原子追加与字段/单行校验。
   - 修复 `lock_append_commit_unique` 漏调 `_normalize_dir(gzx_dir)` 的路径一致性问题。

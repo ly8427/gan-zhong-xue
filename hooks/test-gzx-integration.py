@@ -24,6 +24,14 @@ import sys
 import time
 import tempfile
 
+# Windows CI 运行器控制台编码非 UTF-8（GitHub windows-latest 实测 cp1252）：打印中文
+# 测试名即 UnicodeEncodeError。测试输出强制 UTF-8，与运行平台控制台无关。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass  # 极旧解释器无 reconfigure 时维持原状（行为与基线相同）
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 SKILL_DIR = os.path.join(REPO, "skills", "gan-zhong-xue")

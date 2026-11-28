@@ -21,6 +21,15 @@ import subprocess
 import sys
 import tempfile
 
+# Windows CI 运行器控制台编码非 UTF-8（GitHub windows-latest 实测 cp1252）：打印中文
+# 测试名即 UnicodeEncodeError，套件第一条 check 就崩（PR 头 38231ee 的 Windows check
+# 红的根因）。测试输出强制 UTF-8，与运行平台控制台无关；出错字符降级替换不炸。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass  # 极旧解释器无 reconfigure 时维持原状（行为与基线相同）
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 SKILL_DIR = os.path.join(REPO, "skills", "gan-zhong-xue")
@@ -594,10 +603,21 @@ def test_tmp_cleanup_path_b():
     tmpd = tempfile.mkdtemp(prefix="gzx-d1tmp-")
     minimal = tempfile.mkdtemp(prefix="gzx-d1path-")
     try:
-        for tool in ("cat", "mktemp", "rm", "wc", "mkdir", "dirname", "uname", "python3"):
+        for tool in ("cat", "mktemp", "rm", "wc", "mkdir", "dirname", "uname"):
             src = shutil.which(tool)
             if src:
                 shutil.copy(src, os.path.join(minimal, tool))
+        # python3 垫片：不能用「复制当前解释器」——Windows 上裸 python.exe 缺同目录
+        # 的 python312.dll 起不来（本机实证：command -v 命中但 `import sys` 失败 →
+        # 写入器报 22）；which("python3") 在商店装机上命中的是 WindowsApps 别名桩，
+        # 连复制都做不到（reparse 点，OSError 22）。改为生成两行 bash 垫片转调真实
+        # 解释器，语义（一个可用的 python3）不变且跨平台一致：
+        with open(os.path.join(minimal, "python3"), "w", newline="\n") as f:
+            f.write("#!/bin/bash\nexec \"%s\" \"$@\"\n" % sys.executable.replace("\\", "/"))
+        try:
+            os.chmod(os.path.join(minimal, "python3"), 0o755)
+        except OSError:
+            pass
         env = dict(os.environ, GZX_DIR=_posix(d), TMPDIR=_posix(tmpd), PATH=minimal)
         for idx in range(3):
             r = subprocess.run([BASH_EXE, _posix(WRITER_SH), "pending"],
@@ -661,8 +681,10 @@ def test_cli_and_divergence():
         # 2. 写入短概念 "Foo" 格（若前缀匹配会与 Foo Bar 冲突）
         c_f = json.dumps({"概念": "Foo", "分层": "🟡", "来源": "🟢自", "先猜": "猜2", "证据": "证2", "顶点原理": "理2", "验证题": "题_FOO", "状态": "待复验"})
         subprocess.run([sys.executable, CLI, "save-cell"], env=env, input=c_f.encode("utf-8"), capture_output=True, timeout=30)
-        # 3. 写入长概念 "Foo Bar" 复验追加新格（验证题变更为 题_FB2）
-        c_fb2 = json.dumps({"概念": "Foo Bar", "分层": "🟢自", "来源": "🟢自", "先猜": "猜3", "证据": "证3", "顶点原理": "理3", "验证题": "题_FB2", "状态": "已复验"})
+        # 3. 写入长概念 "Foo Bar" 复验追加新格（验证题变更为 题_FB2）。
+        #    dsh #3055 §5-1：复验在同一分层内追加（分层不变），跨分层是新格——
+        #    旧夹具复验时翻分层会与本批的跨层歧义判定打架，故改同层。
+        c_fb2 = json.dumps({"概念": "Foo Bar", "分层": "🟡", "来源": "🟢自", "先猜": "猜3", "证据": "证3", "顶点原理": "理3", "验证题": "题_FB2", "状态": "已复验"})
         subprocess.run([sys.executable, CLI, "save-cell"], env=env, input=c_fb2.encode("utf-8"), capture_output=True, timeout=30)
 
         # 查短名 "Foo"：必须精确命中 Foo，不得抢占 Foo Bar，题面必须是 题_FOO
@@ -689,6 +711,30 @@ def test_cli_and_divergence():
         check("CLI-4 D2 发散时 check-divergence 必报错并输出双侧计数（退出码 24）",
               r_div1.returncode == 24 and "md_count=5" in err_txt and "jsonl_count=4" in err_txt,
               "rc=%d err=%s" % (r_div1.returncode, err_txt))
+
+        # dsh #3055 §5-1：同概念跨分层 → cell 报歧义（退出码 25），不静默取错层
+        c_fb3 = json.dumps({"概念": "Foo Bar", "分层": "🟢记", "来源": "🟢记", "先猜": "猜4", "证据": "证4", "顶点原理": "理4", "验证题": "题_FB3", "状态": "待复验"})
+        r_x = subprocess.run([sys.executable, CLI, "save-cell"], env=env, input=c_fb3.encode("utf-8"), capture_output=True, timeout=30)
+        check("CLI-2e 前置:跨分层新格写入成功", r_x.returncode == 0,
+              r_x.stderr.decode(errors="replace"))
+        r_amb = subprocess.run([sys.executable, CLI, "cell", "Foo Bar"], env=env, capture_output=True, timeout=30)
+        try:
+            out_amb = json.loads(r_amb.stdout.decode("utf-8"))
+        except ValueError:
+            out_amb = {}
+        check("CLI-2e 同概念跨分层 → 报歧义不静默取格（退出码 25）",
+              r_amb.returncode == 25 and out_amb.get("ambiguous") is True
+              and out_amb.get("md_section") is None,
+              "rc=%d out=%s" % (r_amb.returncode, out_amb))
+        r_pre = subprocess.run([sys.executable, CLI, "cell", "Foo Bar", "🟢记"], env=env, capture_output=True, timeout=30)
+        try:
+            out_pre = json.loads(r_pre.stdout.decode("utf-8"))
+        except ValueError:
+            out_pre = {}
+        check("CLI-2f cell <概念> <分层> 精确取格（不取错层）",
+              r_pre.returncode == 0 and "题_FB3" in (out_pre.get("md_section") or "")
+              and "题_FB1" not in (out_pre.get("md_section") or ""),
+              "rc=%d md=%s" % (r_pre.returncode, (out_pre.get("md_section") or "")[:80]))
     finally:
         _rmtree(d)
 
@@ -797,6 +843,55 @@ def test_capture_special_cases():
         check("CAP-X3 Bugbot3: 花括号分组内 cd 追踪捕获成功", h3 in shas, repr(shas))
         check("CAP-X4 Bugbot3: 花括号分组后 cd 外溢顶层捕获成功", h4 in shas, repr(shas))
         check("CAP-X5 Bugbot3: 圆括号子 shell 内 cd 捕获成功", h5 in shas, repr(shas))
+
+        # 6) grok #3054/#3059 残余：`);` 粘连拆分——子壳内与外层两次提交，外层不漏
+        #    （punctuation_chars 把 `);` 并成单 token 的第三次现形，dsh #3055 §5-4）
+        #    lex 层钉拆分（确定性，无 git 依赖）：
+        import importlib.util as _ilu
+        _spec = _ilu.spec_from_file_location("gzx_capture_mod", CAPTURE)
+        _cap = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_cap)
+        _lx = _cap._lex("( cd x && git commit ); git commit")
+        check("CAP-L1 `);` 粘连在 lex 层拆为 ) 与 ; 两词元",
+              ")" in _lx and ";" in _lx and ");" not in _lx, repr(_lx))
+        #    端到端：子壳内 commit（repo）+ 外层 commit（cwd 自身也是仓库）
+        with open(os.path.join(repo, "f.txt"), "w", encoding="utf-8") as f:
+            f.write("6\n")
+        git("add", "f.txt")
+        git("commit", "-m", "inner-glued")
+        h6 = git("rev-parse", "HEAD").stdout.decode().strip()
+        s6 = git("rev-parse", "--short", "HEAD").stdout.decode().strip()
+        subprocess.run(["git", "-C", other, "init", "-b", "main"],
+                       capture_output=True, timeout=30)
+        subprocess.run(["git", "-C", other, "config", "user.email", "t@example.invalid"],
+                       capture_output=True, timeout=30)
+        subprocess.run(["git", "-C", other, "config", "user.name", "t"],
+                       capture_output=True, timeout=30)
+        with open(os.path.join(other, "g.txt"), "w", encoding="utf-8") as f:
+            f.write("7\n")
+        subprocess.run(["git", "-C", other, "add", "g.txt"], capture_output=True, timeout=30)
+        subprocess.run(["git", "-C", other, "commit", "-q", "-m", "outer-base"],
+                       capture_output=True, timeout=30)
+        with open(os.path.join(other, "g.txt"), "a", encoding="utf-8") as f:
+            f.write("7b\n")
+        subprocess.run(["git", "-C", other, "add", "g.txt"], capture_output=True, timeout=30)
+        h7 = subprocess.run(["git", "-C", other, "rev-parse", "HEAD"],
+                            capture_output=True, timeout=30).stdout.decode().strip()
+        s7 = h7[:7]
+        ev6 = json.dumps({
+            "tool_name": "Bash",
+            "tool_input": {"command": "( cd %s && git commit -m inner-glued ); git commit -m outer-glued"
+                           % _posix(repo)},
+            "cwd": other,
+            "tool_response": {"output": "[main %s] inner-glued\n[main %s] outer-glued"
+                              % (s6, s7)},
+        })
+        subprocess.run([sys.executable, CAPTURE], env=env, input=ev6.encode(),
+                       capture_output=True, timeout=30)
+        cand2 = os.path.join(d, "candidates.jsonl")
+        shas2 = [json.loads(l)["sha"] for l in open(cand2, encoding="utf-8") if l.strip()] \
+            if os.path.exists(cand2) else []
+        check("CAP-X6 `);` 粘连拆分后外层 commit 不再漏捕获", h7 in shas2, repr(shas2))
     finally:
         _rmtree(d)
         _rmtree(other)

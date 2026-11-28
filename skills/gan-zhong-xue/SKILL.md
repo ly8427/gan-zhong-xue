@@ -74,14 +74,14 @@ python3 '<SKILL_DIR>/gzx_cli.py' preflight
 ```
 
 根据返回的 JSON 依次处理：
-- **`divergence.diverged == true`**：若 `reason == "count-mismatch"`，当场向用户报告两侧计数（`md_count` vs `jsonl_count`）及提示，不静默忽略；若为 `legacy-md-only` 则仅读取 `legacy_md` 作历史参考，不迁移旧格。
+- **`divergence.diverged == true`**：若 `reason == "count-mismatch"`，当场向用户报告两侧计数（`md_count` vs `jsonl_count`）及提示，不静默忽略；若为 `field-mismatch`，按 `cell_check.mismatches` 以 map.jsonl 为准修正 map.md 对应格；若为 `legacy-md-only` 则仅读取 `legacy_md` 作历史参考，不迁移旧格。
 - **`pending.count > 0`**：先问用户是否继续上次未挖完的点；只有用户**明确说“不要了”**时，才用 `python3 '<SKILL_DIR>/gzx_cli.py' pending-clear` 清空。
 - **`candidates.count > 0`**：口头提醒“最近有 N 个提交待回看”，询问是否挑一个挖（台账只增不删）。
 - **`map.concepts` / `map.paused_by_target`**：若本次目标命中旧的 `待复验` 格，优先复验那格；若需查看某格 `map.md` 细节或复验原题，运行：
   ```bash
   python3 '<SKILL_DIR>/gzx_cli.py' cell '<概念>'
   ```
-  复验取题与 `⏸` 按靶 ID 调度细则见 [references/branches.md](references/branches.md)。
+  若返回 `ambiguous: true`（同概念跨多个分层，退出码 25），改用 `cell '<概念>' '<分层>'` 精确取格——**绝不跨层静默取格**（跨时间裁判会取错题）。复验取题与 `⏸` 按靶 ID 调度细则见 [references/branches.md](references/branches.md)。
 
 ### 第 0 步：定靶与持久靶 ID
 
@@ -105,10 +105,10 @@ git diff HEAD~1 --stat 2>/dev/null
 3. 中途冒出新问题（A 类前置缺口 / B 类换场好奇 / 独立问题）的分流与防发散规则，按需读取 [references/branches.md](references/branches.md)。
 4. 释放阀：用户想回去干活 → 立即转第 4 步存档，不强留。
 
-### 第 3 步：摆证据 + 自判 + 原子写地图
+### 第 3 步：摆证据 + 自判 + 互斥写地图
 
 1. **摆证据**（用户揭示前后原话，脱敏）→ **用户自判**（`🟢自` / `🟢记` / `🟡` / `🔴`）→ **收尾互评**（“哪处是你纠正了我 / 你比我懂的？”）。
-2. **单锁双写落盘**：通过 `gzx_cli.py save-cell` 一次完成字段校验与 `map.jsonl` + `map.md` 同锁原子追加（状态翻转/复验通过同样追加新行，绝不改旧行）：
+2. **单锁双写落盘**：通过 `gzx_cli.py save-cell` 一次完成字段校验与 `map.jsonl` + `map.md` 同锁互斥追加（单写者互斥；**非跨文件事务原子**。状态翻转/复验通过同样追加新行，绝不改旧行）：
 
 ```bash
 python3 '<SKILL_DIR>/gzx_cli.py' save-cell <<'GZX_JSON_EOF'
